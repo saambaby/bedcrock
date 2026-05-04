@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Bedcrock EOD Job Weekdays at 4:30 PM ET (21:30 UTC during EST, 20:30 during EDT — adjust for DST)
+
+[Timer]
+# 4:35 PM ET = 21:35 UTC (EST) / 20:35 UTC (EDT)
+# We use 21:35 UTC; during DST the run will fire at 5:35pm ET which is fine
+OnCalendar=Mon..Fri 21:35:00 UTC
+Persistent=true
+Unit=ct-eod.service
+
+[Install]
+WantedBy=timers.target

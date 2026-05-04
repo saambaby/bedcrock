@@ -1,0 +1,87 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ct-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bedcrock}
+      POSTGRES_USER: ${POSTGRES_USER:-bedcrock}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bedcrock} -d ${POSTGRES_DB:-bedcrock}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ingest:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: ct-ingest
+    restart: unless-stopped
+    command: python -m src.workers.ingest_worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bedcrock}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bedcrock}
+    volumes:
+      - ${VAULT_PATH}:${VAULT_PATH}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  monitor:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: ct-monitor
+    restart: unless-stopped
+    command: python -m src.workers.monitor_worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bedcrock}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bedcrock}
+    volumes:
+      - ${VAULT_PATH}:${VAULT_PATH}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: ct-bot
+    restart: unless-stopped
+    command: python -m src.workers.bot_worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bedcrock}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bedcrock}
+    volumes:
+      - ${VAULT_PATH}:${VAULT_PATH}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: ct-api
+    restart: unless-stopped
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8080
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bedcrock}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bedcrock}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ${VAULT_PATH}:${VAULT_PATH}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

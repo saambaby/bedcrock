@@ -1,0 +1,29 @@
+[Unit]
+Description=bedcrock ingest worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bedcrock
+Group=bedcrock
+WorkingDirectory=/home/bedcrock/bedcrock
+EnvironmentFile=/home/bedcrock/bedcrock/.env
+ExecStart=/home/bedcrock/bedcrock/.venv/bin/python -m src.workers.ingest_worker
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/bedcrock
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

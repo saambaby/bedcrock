@@ -1,0 +1,13 @@
+[Unit]
+Description=Bedcrock End-of-Session Job (runs daily after market close)
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=bedcrock
+Group=bedcrock
+WorkingDirectory=/opt/bedcrock
+EnvironmentFile=/opt/bedcrock/.env
+ExecStart=/opt/bedcrock/.venv/bin/python -m src.workers.eod_worker
+StandardOutput=journal
+StandardError=journal

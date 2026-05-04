@@ -1,0 +1,90 @@
+[project]
+name = "bedcrock"
+version = "0.1.0"
+description = "Signal-aggregation and paper-trading backend that feeds an Obsidian vault for Cowork analysis"
+requires-python = ">=3.11"
+authors = [{ name = "Bedcrock" }]
+license = { text = "Personal use only" }
+
+dependencies = [
+    # --- Web / async ---
+    "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
+    "websockets>=12.0",
+    "tenacity>=8.2.0",
+
+    # --- Database ---
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
+    "pgvector>=0.2.5",
+
+    # --- Validation / config ---
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.1",
+
+    # --- Scheduling ---
+    "apscheduler>=3.10.4",
+    "pytz>=2024.1",
+
+    # --- Broker (IBKR for both paper and live) ---
+    "ib-insync>=0.9.86",
+    "yfinance>=0.2.40",
+
+    # --- Indicators ---
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pandas-ta>=0.3.14b0",
+
+    # --- Vault / Markdown ---
+    "python-frontmatter>=1.1.0",
+    "pyyaml>=6.0.1",
+
+    # --- Discord ---
+    "discord.py>=2.4.0",
+    "discord-webhook>=1.3.1",
+
+    # --- API ---
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "itsdangerous>=2.2.0",         # signed deep links
+
+    # --- Observability ---
+    "structlog>=24.1.0",
+    "sentry-sdk>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-vcr>=1.0.2",
+    "vcrpy>=6.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "ipython>=8.24.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "C90"]
+ignore = ["E501", "B008", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
