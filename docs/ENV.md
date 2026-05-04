@@ -1,0 +1,123 @@
+# Environment variables
+
+Every variable read by `src/config.py`. Defaults in parentheses; required vars
+have no default and the app will refuse to start without them.
+
+---
+
+## Mode
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODE` | `paper` | `paper` \| `live`. Selects broker adapter and tags signals/orders/positions accordingly. |
+
+---
+
+## Database
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql+asyncpg://bedcrock:bedcrock@localhost:5432/bedcrock` | Async DSN — must include `+asyncpg`. |
+
+---
+
+## Vault
+
+| Variable | Default | Description |
+|---|---|---|
+| `VAULT_PATH` | — (required) | Absolute path to the `Trading/` folder of your Obsidian vault. |
+
+---
+
+## Broker — IBKR
+
+IB Gateway or TWS must be running. See `docs/BROKER_SETUP.md` for full setup.
+
+| Variable | Default | Description |
+|---|---|---|
+| `IBKR_HOST` | `127.0.0.1` | IB Gateway/TWS host (usually local). |
+| `IBKR_PORT` | `4002` | `4002`/`7497` paper, `4001`/`7496` live. |
+| `IBKR_CLIENT_ID` | `1` | Per-connection unique ID. |
+| `IBKR_ACCOUNT` | `""` | DUxxxxxx (paper) or Uxxxxxxx (live) account number. |
+
+---
+
+## Data sources
+
+| Variable | Source | Default | Notes |
+|---|---|---|---|
+| `QUIVER_API_KEY` | https://www.quiverquant.com/ | — | Hobbyist tier $30/mo Tier 1 access. |
+| `UNUSUAL_WHALES_API_KEY` | https://unusualwhales.com | — | Required for options flow + UW congress. |
+| `FINNHUB_API_KEY` | https://finnhub.io | — | Free tier: 60 req/min. |
+| `POLYGON_API_KEY` | https://polygon.io | — | Optional. If unset, ohlcv falls back to yfinance. |
+| `SEC_USER_AGENT` | self-set | `Bedcrock you@example.com` | SEC requires `Name email@host` format or 403s. |
+
+---
+
+## Discord
+
+See `docs/DISCORD_SETUP.md` for end-to-end setup.
+
+| Variable | Description |
+|---|---|
+| `DISCORD_WEBHOOK_FIREHOSE` | URL of #signals-firehose webhook (every signal). |
+| `DISCORD_WEBHOOK_HIGH_SCORE` | URL of #high-score webhook (score ≥ 6). |
+| `DISCORD_WEBHOOK_POSITIONS` | URL of #position-alerts webhook (entries, closes). |
+| `DISCORD_WEBHOOK_SYSTEM_HEALTH` | URL of #system-health webhook (heartbeats). |
+| `DISCORD_BOT_TOKEN` | Bot token from Developer Portal — for slash commands. |
+| `DISCORD_GUILD_ID` | Optional. Set to your server ID for instant slash-command sync. Empty syncs globally (1h propagation). |
+
+---
+
+## API
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` if exposing publicly (then put a TLS proxy in front). |
+| `API_PORT` | `8080` | Port. |
+| `API_SIGNING_SECRET` | `change-me` | Required. Used to sign deep-link tokens (`itsdangerous`). Must be ≥ 32 chars in production. |
+
+---
+
+## Schedule
+
+| Variable | Default | Description |
+|---|---|---|
+| `INGEST_INTERVAL_FAST_MIN` | `15` | Fast ingestors (UW flow, SEC). |
+| `INGEST_INTERVAL_SLOW_MIN` | `30` | Slow ingestors (Quiver, UW congress). |
+| `INGEST_EARNINGS_HOUR_ET` | `6` | Hour of day (ET) to refresh earnings calendar. |
+
+---
+
+## Risk limits
+
+These are gate defaults; the vault file `99 Meta/risk-limits.md` is human-editable
+and the gate stack reads it at runtime when implemented (v0.2).
+
+| Variable | Default | Description |
+|---|---|---|
+| `RISK_DAILY_LOSS_PCT` | `2.0` | Daily kill-switch threshold. |
+| `RISK_PER_TRADE_PCT` | `1.0` | Equity at risk per trade. |
+| `RISK_MAX_OPEN_POSITIONS` | `8` | Max concurrent positions. |
+| `RISK_MIN_ADV_USD` | `5000000` | 30-day average dollar volume floor. |
+| `RISK_EARNINGS_BLACKOUT_DAYS` | `3` | Block entries within N days of earnings. |
+| `RISK_EVENT_BLACKOUT_DAYS` | `2` | Block entries within N days of FOMC/CPI/NFP (v0.2). |
+
+---
+
+## Observability
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | `DEBUG` for development. |
+| `LOG_FORMAT` | `json` | `json` for production (parseable by Loki/Datadog), `text` for development. |
+| `SENTRY_DSN` | `""` | Optional. Errors auto-report. |
+
+---
+
+## A note on secrets
+
+- Never commit `.env`. The `.gitignore` already excludes it.
+- Rotate API keys quarterly; broker keys yearly. Never share between paper and live.
+- `API_SIGNING_SECRET` is what protects the deep-link confirm/skip URLs. If it
+  leaks, anyone who saw a Discord embed in your server could submit orders.
