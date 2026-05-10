@@ -43,14 +43,18 @@ bedcrock/
 │   ├── db/                    # SQLAlchemy models, async session
 │   ├── schemas/               # Pydantic request/response models
 │   ├── ingestors/             # one per data source
+│   │   └── heavy_movement.py  # v2 N1 — volume/52w/gap corroboration ingestor
 │   ├── indicators/            # OHLCV + indicator computation
-│   ├── scoring/               # scorer + hard gates
-│   ├── broker/                # alpaca, ibkr (stub)
+│   ├── scoring/               # scorer + hard gates (incl. v2 sector-correlation)
+│   ├── broker/                # ibkr adapter (paper + live, port-switched)
 │   ├── orders/                # bracket builder, live monitor
+│   ├── safety/                # v2 — startup reconciler (broker truth wins)
+│   ├── backtest/              # v2 N4 — mini-replay for scoring-rule changes
 │   ├── vault/                 # writes .md files into the Obsidian vault
 │   ├── discord_bot/           # webhooks + slash command bot
 │   ├── api/                   # FastAPI: health, /confirm, /skip
 │   └── workers/               # process entry points (one per systemd unit)
+│       └── daily_pnl.py       # v2 F5 — populates daily_pnl_pct for kill switch
 ├── vault-templates/           # frontmatter templates + 99-Meta seed files
 ├── cowork-prompts/            # the four scheduled-task prompts
 ├── deploy/
@@ -74,6 +78,9 @@ These come from the plan and are enforced in code:
 3. **Inbox-then-process.** Backend writes only to `00 Inbox/`. Cowork writes everywhere else.
 4. **Humans confirm entries; the broker enforces exits.** Server-side OCO at the broker. Bot never opens positions without your `/confirm`.
 5. **No mocks in prod.** All ingestors talk to real endpoints. Tests use VCR cassettes against real responses, not hand-written fakes.
+6. **Broker truth wins on conflict.** (v2) On startup or post-disconnect reconnect, IBKR's view of positions and open orders is the source of truth; the DB is repaired to match, with an audit-log entry per repair.
+7. **Stops are GTC by construction.** (v2) No code path may submit a child order with `tif != "GTC"`. The reconciler audit re-issues any non-conforming order found on the wire.
+8. **Mode and port are coupled.** (v2) `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`; `MODE=live` requires `{4001, 7496}`. Mismatched config refuses to boot.
 
 ## Audit trail
 
