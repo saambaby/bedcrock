@@ -52,6 +52,24 @@ class Scorer:
         """
         b = ScoreBreakdown()
 
+        # Hard rule (v2 N1): MARKET_MOVEMENT signals never score above 0
+        # in isolation. They only count as corroboration for an existing
+        # fundamental signal in the last 14d. This preserves the
+        # "disclosure-driven thesis" invariant — market movement alone
+        # must never trigger a draft.
+        if signal.source == SignalSource.MARKET_MOVEMENT:
+            cutoff = datetime.now(UTC) - timedelta(days=14)
+            has_fundamental = any(
+                s.source != SignalSource.MARKET_MOVEMENT
+                and s.disclosed_at >= cutoff
+                and s.ticker == signal.ticker
+                for s in prior_signals_30d
+            )
+            if not has_fundamental:
+                return 0.0, b
+            b.flow_corroboration_market = self.weights["options_flow_corroboration"]
+            return b.total, b
+
         # 1. Cluster — distinct sources/traders agreeing on direction in 30d
         b.cluster = self._score_cluster(signal, prior_signals_30d)
 
@@ -81,14 +99,37 @@ class Scorer:
     # --- Component scorers ---
 
     def _score_cluster(self, signal: RawSignal, prior: list[Signal]) -> float:
-        """+1 per additional independent source on this ticker, same direction, 30d."""
-        same_dir = [s for s in prior if s.action == signal.action and s.ticker == signal.ticker]
+        """+1 per additional independent fundamental source on this ticker, same direction, 30d.
+
+        v2 (N1): MARKET_MOVEMENT signals are excluded from independent-source counting
+        (they're corroboration, not a primary thesis), but a same-direction
+        MARKET_MOVEMENT signal in the last 14d adds a +0.5 cluster bonus.
+        """
+        same_dir = [
+            s for s in prior
+            if s.action == signal.action
+            and s.ticker == signal.ticker
+            and s.source != SignalSource.MARKET_MOVEMENT
+        ]
         # Distinct sources excluding our own ingestion
         sources = {s.source for s in same_dir} - {signal.source}
         # Distinct traders
         traders = {s.trader_id for s in same_dir if s.trader_id is not None}
         independent_count = len(sources) + max(0, len(traders) - len(sources))
         score = independent_count * self.weights["cluster_per_extra_source"]
+
+        # v2 N1 bonus: MARKET_MOVEMENT corroboration in last 14d, same direction
+        cutoff = datetime.now(UTC) - timedelta(days=14)
+        has_movement = any(
+            s.source == SignalSource.MARKET_MOVEMENT
+            and s.action == signal.action
+            and s.ticker == signal.ticker
+            and s.disclosed_at >= cutoff
+            for s in prior
+        )
+        if has_movement:
+            score += 0.5
+
         return min(score, self.weights["cluster_max"])
 
     def _score_insider_corroboration(self, signal: RawSignal, prior: list[Signal]) -> float:
