@@ -437,3 +437,101 @@ def test_custom_weights_insider_corroboration(base_signal):
     scorer = Scorer(weights=custom)
     prior = [make_signal(SignalSource.SEC_FORM4, Action.BUY, "NVDA")]
     assert scorer._score_insider_corroboration(base_signal, prior) == 10.0
+
+
+# ---------------------------------------------------------------------------
+# v2 N1 — MARKET_MOVEMENT corroboration
+# ---------------------------------------------------------------------------
+
+
+def test_market_movement_alone_scores_zero():
+    """A lone MARKET_MOVEMENT signal with no fundamental priors scores 0."""
+    sig = RawSignal(
+        source=SignalSource.MARKET_MOVEMENT,
+        source_external_id="mm-alone",
+        ticker="NVDA",
+        action=Action.BUY,
+        disclosed_at=datetime.now(UTC),
+    )
+    scorer = Scorer()
+    total, breakdown = scorer.score(sig, prior_signals_30d=[], indicators=None)
+    assert total == 0.0
+    assert breakdown.flow_corroboration_market == 0.0
+
+
+def test_market_movement_corroborates_existing():
+    """MARKET_MOVEMENT + a recent (14d) Form 4 → flow_corroboration_market > 0."""
+    sig = RawSignal(
+        source=SignalSource.MARKET_MOVEMENT,
+        source_external_id="mm-corrob",
+        ticker="NVDA",
+        action=Action.BUY,
+        disclosed_at=datetime.now(UTC),
+    )
+    recent = datetime.now(UTC) - timedelta(days=3)
+    prior = [make_signal(SignalSource.SEC_FORM4, Action.BUY, "NVDA", disclosed_at=recent)]
+    scorer = Scorer()
+    total, breakdown = scorer.score(sig, prior_signals_30d=prior, indicators=None)
+    assert breakdown.flow_corroboration_market > 0
+    assert total == breakdown.total
+    # Other slots should remain zero — MARKET_MOVEMENT path returns early.
+    assert breakdown.cluster == 0.0
+    assert breakdown.insider_corroboration == 0.0
+
+
+def test_market_movement_stale_fundamental_scores_zero():
+    """A fundamental signal older than 14d does not corroborate market movement."""
+    sig = RawSignal(
+        source=SignalSource.MARKET_MOVEMENT,
+        source_external_id="mm-stale",
+        ticker="NVDA",
+        action=Action.BUY,
+        disclosed_at=datetime.now(UTC),
+    )
+    stale = datetime.now(UTC) - timedelta(days=20)
+    prior = [make_signal(SignalSource.SEC_FORM4, Action.BUY, "NVDA", disclosed_at=stale)]
+    scorer = Scorer()
+    total, _ = scorer.score(sig, prior_signals_30d=prior, indicators=None)
+    assert total == 0.0
+
+
+def test_cluster_bonus_for_movement(base_signal):
+    """Two fundamental sources + a same-direction MARKET_MOVEMENT in 14d → +0.5 bonus."""
+    recent = datetime.now(UTC) - timedelta(days=2)
+    prior = [
+        make_signal(SignalSource.SEC_FORM4, Action.BUY, "NVDA"),
+        make_signal(SignalSource.UW_FLOW, Action.BUY, "NVDA"),
+        make_signal(
+            SignalSource.MARKET_MOVEMENT, Action.BUY, "NVDA", disclosed_at=recent
+        ),
+    ]
+    scorer = Scorer()
+    cluster = scorer._score_cluster(base_signal, prior)
+    # 2 fundamental sources (SEC_FORM4, UW_FLOW) → 2.0, +0.5 movement bonus = 2.5
+    assert cluster == 2.5
+
+
+def test_cluster_movement_excluded_from_source_count(base_signal):
+    """A lone MARKET_MOVEMENT prior contributes 0.5 (bonus) — not 1.0 (source)."""
+    recent = datetime.now(UTC) - timedelta(days=1)
+    prior = [
+        make_signal(
+            SignalSource.MARKET_MOVEMENT, Action.BUY, "NVDA", disclosed_at=recent
+        ),
+    ]
+    scorer = Scorer()
+    assert scorer._score_cluster(base_signal, prior) == 0.5
+
+
+def test_cluster_stale_movement_no_bonus(base_signal):
+    """A stale (>14d) MARKET_MOVEMENT does not add the bonus."""
+    stale = datetime.now(UTC) - timedelta(days=20)
+    prior = [
+        make_signal(SignalSource.SEC_FORM4, Action.BUY, "NVDA"),
+        make_signal(
+            SignalSource.MARKET_MOVEMENT, Action.BUY, "NVDA", disclosed_at=stale
+        ),
+    ]
+    scorer = Scorer()
+    # Just 1 fundamental source, no bonus
+    assert scorer._score_cluster(base_signal, prior) == 1.0
