@@ -184,5 +184,64 @@ def write_daily_note(
     return path
 
 
+async def write_start_of_day_snapshot() -> None:
+    """Write a pre-open `EquitySnapshot` for today so `update_daily_pnl`
+    has a baseline.
+
+    Idempotent: if a snapshot already exists for today (e.g. EOD ran for
+    a prior session and rolled forward, or this was already invoked),
+    it is left untouched. Schedule via cron at ~09:25 ET on weekdays:
+
+        25 9 * * 1-5  python -m src.workers.eod_worker --sod
+    """
+    configure_logging()
+    today = datetime.now(UTC).date()
+    today_dt = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+    logger.info("sod_snapshot_starting", date=today.isoformat(), mode=settings.mode.value)
+
+    broker = get_broker()
+    try:
+        await broker.connect()
+        account = await broker.get_account()
+    except Exception as e:
+        logger.error("sod_snapshot_get_account_failed", error=str(e))
+        await broker.disconnect()
+        await dispose()
+        return
+    finally:
+        await broker.disconnect()
+
+    async with SessionLocal() as db:
+        existing = (await db.execute(
+            select(EquitySnapshot).where(
+                EquitySnapshot.mode == settings.mode,
+                EquitySnapshot.snapshot_date == today_dt,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            logger.info("sod_snapshot_already_present", date=today.isoformat())
+            await dispose()
+            return
+
+        stmt = pg_insert(EquitySnapshot).values(
+            mode=settings.mode,
+            snapshot_date=today_dt,
+            equity=account.equity,
+            cash=account.cash,
+            positions_value=account.positions_value,
+            daily_pnl=Decimal("0"),
+            daily_pnl_pct=Decimal("0"),
+        ).on_conflict_do_nothing(index_elements=["mode", "snapshot_date"])
+        await db.execute(stmt)
+        await db.commit()
+
+    await dispose()
+    logger.info("sod_snapshot_done", equity=str(account.equity))
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if "--sod" in sys.argv:
+        asyncio.run(write_start_of_day_snapshot())
+    else:
+        asyncio.run(main())

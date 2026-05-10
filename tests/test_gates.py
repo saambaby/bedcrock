@@ -7,12 +7,13 @@ Run: pytest tests/test_gates.py
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.db.models import Action, GateName, SignalSource
+from src.db.models import Action, DailyState, GateName, Mode, SignalSource
 from src.schemas import IndicatorSnapshot, RawSignal
 from src.scoring.gates import GateEvaluator
 
@@ -174,3 +175,58 @@ async def test_liquidity_below_threshold_not_overrideable(evaluator):
     )
     result = await evaluator._gate_liquidity(ind)
     assert result.overrideable is False
+
+
+# ---------------------------------------------------------------------------
+# Daily kill switch gate
+# ---------------------------------------------------------------------------
+
+
+def _mock_db_with_daily_state(state: DailyState | None) -> MagicMock:
+    """Build an AsyncSession-like mock whose `execute(...).scalar_one_or_none()`
+    returns the supplied DailyState (or None)."""
+    db = MagicMock()
+    result = MagicMock()
+    result.scalar_one_or_none = MagicMock(return_value=state)
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_blocks_at_negative_threshold(evaluator):
+    """P&L of -2.5% is past the default 2% threshold — blocked, not overrideable."""
+    state = DailyState(
+        date=date.today(),
+        mode=Mode.PAPER,
+        daily_pnl_pct=Decimal("-2.5"),
+        equity_at_open=Decimal("100000"),
+    )
+    db = _mock_db_with_daily_state(state)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.gate == GateName.DAILY_KILL_SWITCH
+    assert result.blocked is True
+    assert result.overrideable is False
+    assert "kill switch" in (result.reason or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_passes_above_threshold(evaluator):
+    """P&L of -1% is within tolerance — passes."""
+    state = DailyState(
+        date=date.today(),
+        mode=Mode.PAPER,
+        daily_pnl_pct=Decimal("-1.0"),
+        equity_at_open=Decimal("100000"),
+    )
+    db = _mock_db_with_daily_state(state)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.blocked is False
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_passes_when_no_state(evaluator):
+    """No DailyState row (e.g. before pre-open snapshot) — fail-open, pass."""
+    db = _mock_db_with_daily_state(None)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.gate == GateName.DAILY_KILL_SWITCH
+    assert result.blocked is False

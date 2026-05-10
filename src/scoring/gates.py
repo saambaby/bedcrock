@@ -9,13 +9,15 @@ won anyway?"
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models import (
+    DailyState,
     EarningsCalendar,
     GateName,
     Position,
@@ -46,12 +48,11 @@ class GateEvaluator:
         results.append(await self._gate_stale_signal(signal))
         results.append(await self._gate_snoozed(db, signal))
         results.append(await self._gate_max_open_positions(db))
+        results.append(await self._gate_daily_kill_switch(db))
 
-        # Correlation, event-proximity, daily-kill require richer context;
-        # deferred to v0.2. For now they pass.
+        # Correlation and event-proximity remain stubs (B4 owns correlation).
         results.append(GateResult(gate=GateName.CORRELATION, blocked=False))
         results.append(GateResult(gate=GateName.EVENT_PROXIMITY, blocked=False))
-        results.append(GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False))
 
         return results
 
@@ -139,3 +140,31 @@ class GateEvaluator:
                 overrideable=False,
             )
         return GateResult(gate=GateName.MAX_OPEN_POSITIONS, blocked=False)
+
+    async def _gate_daily_kill_switch(self, db: AsyncSession) -> GateResult:
+        """Trip when today's intraday P&L breaches `risk_daily_loss_pct`.
+
+        Reads `DailyState` for `(date.today(), settings.mode)`. If no row exists
+        (e.g. before the pre-open snapshot lands), fail-open — we'd rather take
+        a trade than block the whole session on a stale state table.
+        """
+        stmt = select(DailyState).where(
+            DailyState.date == date.today(),
+            DailyState.mode == settings.mode,
+        )
+        row = (await db.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False)
+
+        threshold = Decimal(str(settings.risk_daily_loss_pct))
+        if row.daily_pnl_pct <= -threshold:
+            return GateResult(
+                gate=GateName.DAILY_KILL_SWITCH,
+                blocked=True,
+                reason=(
+                    f"Daily P&L {row.daily_pnl_pct:.2f}% breached "
+                    f"-{threshold:.2f}% kill switch"
+                ),
+                overrideable=False,
+            )
+        return GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False)
