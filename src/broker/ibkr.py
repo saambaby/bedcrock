@@ -23,6 +23,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -72,34 +73,69 @@ class IBKRBroker(BrokerAdapter):
     def is_paper(self) -> bool:
         return settings.is_paper
 
-    async def connect(self) -> None:
+    async def connect(self, readonly: bool = False) -> None:
         if self._connected and self._ib.isConnected():
             return
         host = settings.ibkr_host
         port = settings.ibkr_port
         client_id = settings.ibkr_client_id
 
+        # Exponential-backoff retry: 5 attempts at 1s, 2s, 4s, 8s, 16s
+        delays = [1, 2, 4, 8, 16]
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate(delays, start=1):
+            try:
+                await self._ib.connectAsync(
+                    host=host,
+                    port=port,
+                    clientId=client_id,
+                    readonly=readonly,
+                    account=settings.ibkr_account or "",
+                )
+                self._connected = True
+                logger.info(
+                    "ibkr_connected",
+                    host=host,
+                    port=port,
+                    client_id=client_id,
+                    paper=self.is_paper,
+                    readonly=readonly,
+                    attempt=attempt,
+                )
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "ibkr_connect_attempt_failed",
+                    host=host,
+                    port=port,
+                    attempt=attempt,
+                    delay=delay,
+                    error=str(e),
+                )
+                if attempt < len(delays):
+                    await asyncio.sleep(delay)
+
+        # Terminal alert via Discord system-health webhook
         try:
-            await self._ib.connectAsync(
-                host=host,
-                port=port,
-                clientId=client_id,
-                readonly=False,
-                account=settings.ibkr_account or "",
+            from src.discord_bot.webhooks import post_system_health
+
+            await post_system_health(
+                title="IBKR connection failed",
+                body=(
+                    f"Could not connect to IB Gateway at {host}:{port} after "
+                    f"{len(delays)} attempts. Last error: {last_exc}"
+                ),
+                ok=False,
             )
-            self._connected = True
-            logger.info(
-                "ibkr_connected",
-                host=host,
-                port=port,
-                client_id=client_id,
-                paper=self.is_paper,
-            )
-        except Exception as e:
-            raise BrokerError(
-                f"Failed to connect to IB Gateway at {host}:{port} — "
-                f"is IB Gateway/TWS running? Error: {e}"
-            ) from e
+        except Exception as alert_exc:
+            logger.error("ibkr_connect_alert_failed", error=str(alert_exc))
+
+        raise BrokerError(
+            f"Failed to connect to IB Gateway at {host}:{port} after "
+            f"{len(delays)} attempts — is IB Gateway/TWS running? "
+            f"Last error: {last_exc}"
+        ) from last_exc
 
     async def disconnect(self) -> None:
         if self._ib.isConnected():
@@ -179,10 +215,23 @@ class IBKRBroker(BrokerAdapter):
             stopLossPrice=stop_price,
         )
 
+        # bracket = [parent, take_profit, stop_loss]
+        parent, take_profit, stop_loss = bracket
+
+        # Parent: DAY (entry zone is a same-day decision per plan v1 §6.2)
+        parent.tif = "DAY"
+        parent.outsideRth = False
+
+        # Children MUST be GTC + outsideRth — otherwise stop expires at session
+        # close and overnight gap risk has no protection (audit §3.2).
+        for child in (take_profit, stop_loss):
+            child.tif = "GTC"
+            child.outsideRth = True
+
         # Set client_order_id on parent for idempotency
         client_order_id = getattr(spec, "client_order_id", None)
         if client_order_id:
-            bracket[0].orderRef = client_order_id
+            parent.orderRef = client_order_id
 
         trades: list[Trade] = []
         try:
