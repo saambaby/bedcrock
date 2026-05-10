@@ -266,4 +266,7 @@ async def test_replay_recommends_reject_when_oos_worse(monkeypatch):
 
     assert isinstance(report, ReplayReport)
     assert report.recommendation == "REJECT"
-    assert report.sharpe_delta_vs_baseline < 0
+    # Constant-pnl arms produce stdev=0, so sharpes are both 0 and the delta is 0;
+    # REJECT is decided via the mean-pnl tiebreak. Verify the proposed mean is worse.
+    assert report.total_return_pct < 0
+    assert report.sharpe_delta_vs_baseline <= 0

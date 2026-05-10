@@ -48,8 +48,10 @@ def _build_ingestor(df: pd.DataFrame, *, watchlist: set[str] | None = None):
     ohlcv.fetch_daily = AsyncMock(return_value=df)
 
     ing = HeavyMovementIngestor(ohlcv=ohlcv, now_fn=_mid_market_now)
-    # Stub watchlist
-    ing._build_watchlist = AsyncMock(return_value=set(watchlist or {"NVDA"}))
+    # Stub watchlist — `is None` (not truthy) so explicit empty set is respected
+    if watchlist is None:
+        watchlist = {"NVDA"}
+    ing._build_watchlist = AsyncMock(return_value=set(watchlist))
     # Stub heartbeat (no DB)
     ing._heartbeat = AsyncMock()
     return ing

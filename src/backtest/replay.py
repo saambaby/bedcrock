@@ -160,9 +160,24 @@ async def replay(
     baseline_oos_sharpe = _sharpe([t.pnl_pct for t in baseline_out_sample])
 
     delta = oos_sharpe - baseline_oos_sharpe
+
+    # Tiebreak on mean PnL when sharpes are equal (e.g., constant returns
+    # produce stdev=0 → sharpe=0 for both arms).
+    proposed_mean = (
+        statistics.mean([t.pnl_pct for t in out_sample_trades])
+        if out_sample_trades else 0.0
+    )
+    baseline_mean = (
+        statistics.mean([t.pnl_pct for t in baseline_out_sample])
+        if baseline_out_sample else 0.0
+    )
+    mean_delta = proposed_mean - baseline_mean
+
     if oos_sharpe > baseline_oos_sharpe and oos_sharpe > 1.0:
         rec = "ADOPT"
-    elif oos_sharpe < baseline_oos_sharpe:
+    elif oos_sharpe < baseline_oos_sharpe or (
+        oos_sharpe == baseline_oos_sharpe and mean_delta < 0
+    ):
         rec = "REJECT"
     else:
         rec = "INCONCLUSIVE"

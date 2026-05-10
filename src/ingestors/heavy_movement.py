@@ -180,7 +180,7 @@ class HeavyMovementIngestor(BaseIngestor):
 
         volume_ratio = today_volume / avg_vol
         gap_pct = (today_open / prior_close) - 1.0
-        is_breakout = prior_high_52w > 0 and today_high >= prior_high_52w
+        is_breakout = prior_high_52w > 0 and today_high > prior_high_52w
 
         # Hard exclusion — major gap down is panic, not corroboration
         if gap_pct <= GAP_DOWN_KILL:
