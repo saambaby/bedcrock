@@ -115,6 +115,36 @@ and the gate stack reads it at runtime when implemented (v0.2).
 
 ---
 
+## v2 additions
+
+These variables were introduced in v2 (see `bedcrock-plan-v2.md`).
+
+### Risk — half-Kelly cap and sector concentration (N2, N3)
+
+| Variable | Default | Description |
+|---|---|---|
+| `RISK_MAX_POSITION_SIZE_PCT` | `0.05` | Half-Kelly per-position size cap as a fraction of equity. The order builder caps `qty` so notional ≤ `equity × this`. Defends against pathological tight-stop sizing. |
+| `RISK_SECTOR_CONCENTRATION_LIMIT` | `0.25` | Sector-correlation gate ceiling — fraction of equity allowed in any one sector. The gate blocks new entries that would push a sector's open notional above this. |
+
+### Heavy-movement ingestor (N1)
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOVEMENT_VOLUME_SPIKE_THRESHOLD` | `3.0` | Volume multiple over 30-day average that flags a "heavy movement" candidate. |
+| `MOVEMENT_GAP_THRESHOLD` | `0.05` | Gap (open vs prior close) magnitude that flags a candidate. |
+| `MOVEMENT_CHECK_INTERVAL_SECONDS` | `300` | Poll cadence for the heavy-movement ingestor. |
+
+### Mode↔port coupling (invariant 9)
+
+The config validator now refuses to start when `MODE` and `IBKR_PORT` disagree:
+
+- `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`
+- `MODE=live` requires `IBKR_PORT ∈ {4001, 7496}`
+
+A mismatched pair raises a `ValueError` at import time — the bot will not run.
+
+---
+
 ## A note on secrets
 
 - Never commit `.env`. The `.gitignore` already excludes it.

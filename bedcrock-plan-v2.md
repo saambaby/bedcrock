@@ -1,8 +1,9 @@
 ---
 title: Bedcrock — Build & Migration Plan v2
-status: draft
+status: active
 phase: paper-1
 created: 2026-05-10
+implemented: 2026-05-10
 supersedes: bedcrock-plan.md (v1, 2026-05-03)
 tags: [trading/system, plan, obsidian]
 ---

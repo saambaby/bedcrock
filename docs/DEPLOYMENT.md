@@ -177,6 +177,17 @@ The vault is the source of truth — Syncthing already gives you 2 copies
 
 The DB can be rebuilt from the vault if needed (rehydrate worker — TODO v0.2).
 
+## IB Gateway operational notes
+
+IB Gateway is not designed to be a 24/7 daemon. Running it reliably as a service requires a few non-obvious things — get these wrong and the bot silently goes offline at 23:45 ET every night.
+
+- **Nightly logout window.** IBKR forces a logout for every gateway session between **23:45 and 00:45 ET**. The session must be re-authenticated before the bot can submit orders again. The bot's reconciler tolerates a 5-minute disconnect on reconnect (broker truth wins on conflict — invariant 7), but anything longer needs operator intervention unless IBC handles re-login automatically.
+- **IBC is mandatory for headless Linux.** Use [`IbcAlpha/IBC`](https://github.com/IbcAlpha/IBC) to drive the Java UI for login + auto-relogin. There is no truly headless mode for IB Gateway — it always renders a window.
+- **Set `AutoRestartTime=23:45` in `IBC/config.ini`.** This causes IBC to re-login right after IBKR's nightly logout. Token-based AutoRestart (the alternative) is **broken on unfunded paper accounts** ([IBC issue #345](https://github.com/IbcAlpha/IBC/issues/345)) — use the time-based variant.
+- **Xvfb is required.** IB Gateway needs an X display even in headless deployment. Run under `xvfb-run` or a persistent `Xvfb :1` and `DISPLAY=:1`.
+- **Easiest path: Docker.** [`gnzsnz/ib-gateway-docker`](https://github.com/gnzsnz/ib-gateway-docker) bundles IBC + Xvfb + IB Gateway into one image with sane defaults. Recommended for new deployments — saves a day of yak-shaving.
+- **Sunday weekly re-auth.** IBKR runs an additional weekly maintenance window starting around **00:01 ET on Sunday**. Same 5-minute reconciler tolerance applies; nothing operator-side to do.
+
 ## Troubleshooting
 
 - **Healthcheck FAIL on an ingestor:** check `/var/log/bedcrock/<name>.log`

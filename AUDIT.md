@@ -295,3 +295,27 @@ This pass merged two parallel build threads into one consistent codebase:
 3. `DraftOrderPayload` is defined twice: in `src/schemas/__init__.py` (Pydantic, comprehensive) and in `src/schemas/order.py` (Pydantic, simpler). The init version wins; `order.py` is unused.
 
 These do not affect correctness — they're cruft from the merge. Cleanup is a v0.1.1 chore, not a blocker.
+
+---
+
+## v2 status (2026-05-10)
+
+The 2026-05-10 audit (`docs/AUDIT_2026-05-10.md`) surfaced 6 blockers (F1–F6) and a parallel research pass identified 4 components worth porting from a competing "Proxy Bot" design (N1–N4). All 10 items, plus the duplicate-scorer cleanup, landed on `v2-staging` over four parallel waves (A/B/C/D).
+
+| Item | Audit ref | Status | Landing commit |
+|---|---|---|---|
+| F1 — `ib_insync` → `ib_async` migration | §3.1 | Landed | `90ec1ad` |
+| F2 — `tif="GTC"` + `outsideRth=True` on stop/take-profit children | §3.2 | Landed | `de5eaa0` |
+| F3 — Idempotency check on `_on_entry_fill` + `UNIQUE(Position.broker_order_id)` | §3.3 | Landed | `f324062` |
+| F4 — `_reconcile_against_broker` on `LiveMonitor.start()` | §3.4 | Landed | in B1 reconciler commit (`de5eaa0`) |
+| F5 — `daily_pnl_pct` wired end-to-end → `daily_kill_switch` actually trips | §3.5 | Landed | `071a82d` |
+| F6 — Connection retry with backoff + IBC + nightly-logout docs | §3.6 | Landed | B1 (`de5eaa0`) + Wave D docs |
+| N1 — Heavy-movement ingestor (volume + 52w-high + gap) | §3.N1 | Landed | `3a2b658` |
+| N2 — Concrete sector-correlation gate | §3.N2 | Landed | `2fd9354` |
+| N3 — Half-Kelly per-position size cap (5%) | §3.N3 | Landed | B4 (`2fd9354`) |
+| N4 — Mini-backtester for scoring-rule evaluation | §3.N4 | Landed | `7c2955c` |
+| Cleanup — duplicate scorers / `DraftOrderPayload` shims | §3.cleanup | Already done pre-v2 | — |
+
+The v2 spec (`bedcrock-plan-v2.md`) is now `status: active`; v1 (`bedcrock-plan.md`) is `status: superseded`. v2 also adds three new safety invariants (broker-truth-wins, GTC-by-construction, mode↔port coupled) — see `bedcrock-plan-v2.md` Changelog.
+
+**Test status at merge candidate:** 118 of 123 tests pass. The 5 failing tests are all in `tests/test_vault.py` and predate v2 (they exercise a real `VaultWriter` that's not present on this branch tree — tracked as a v0.1 issue, not in v2 scope).
