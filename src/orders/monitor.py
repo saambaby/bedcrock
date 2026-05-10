@@ -228,6 +228,24 @@ class LiveMonitor:
             logger.warning("entry_fill_no_draft", ticker=ticker)
             return
 
+        # Idempotency: if a Position already exists for this broker_order_id, skip.
+        # Both the ib_async event stream and the 30s reconciler can deliver the
+        # same fill — the UNIQUE(broker_order_id) constraint on Position protects
+        # at the DB layer, but we check first so we don't waste a transaction.
+        existing = (await db.execute(
+            select(Position).where(Position.broker_order_id == broker_order_id)
+        )).scalar_one_or_none()
+        if existing is not None:
+            logger.info(
+                "entry_fill_already_processed",
+                broker_order_id=broker_order_id,
+                ticker=ticker,
+            )
+            if draft.status != OrderStatus.FILLED:
+                draft.status = OrderStatus.FILLED
+                await db.commit()
+            return
+
         position = Position(
             mode=draft.mode,
             ticker=ticker,
@@ -355,6 +373,25 @@ class LiveMonitor:
             try:
                 bo = await self._broker.get_order(draft.broker_order_id)
                 if bo.state == BrokerOrderState.FILLED and bo.filled_avg_price:
+                    # Drift repair: if a Position already exists for this
+                    # broker_order_id (the ws fill won the race), don't try to
+                    # insert a duplicate — just heal the draft status.
+                    existing = (await db.execute(
+                        select(Position).where(
+                            Position.broker_order_id == bo.broker_order_id
+                        )
+                    )).scalar_one_or_none()
+                    if existing is not None:
+                        if draft.status != OrderStatus.FILLED:
+                            draft.status = OrderStatus.FILLED
+                            await db.commit()
+                            logger.info(
+                                "reconcile_repaired_draft_status",
+                                draft_id=str(draft.id),
+                                broker_order_id=bo.broker_order_id,
+                            )
+                        continue
+
                     await self._on_entry_fill(
                         db=db,
                         draft=draft,
