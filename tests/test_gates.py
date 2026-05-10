@@ -174,3 +174,107 @@ async def test_liquidity_below_threshold_not_overrideable(evaluator):
     )
     result = await evaluator._gate_liquidity(ind)
     assert result.overrideable is False
+
+
+# ---------------------------------------------------------------------------
+# Sector correlation gate (V2.6)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock
+
+from src.broker.base import AccountSnapshot
+
+
+def _mock_db_with_positions(positions):
+    db = MagicMock()
+    scalars = MagicMock()
+    scalars.all = MagicMock(return_value=positions)
+    result = MagicMock()
+    result.scalars = MagicMock(return_value=scalars)
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+def _mock_correlation_broker(equity: Decimal):
+    broker = MagicMock()
+    broker.connect = AsyncMock(return_value=None)
+    broker.disconnect = AsyncMock(return_value=None)
+    broker.get_account = AsyncMock(
+        return_value=AccountSnapshot(
+            equity=equity,
+            cash=equity,
+            positions_value=Decimal("0"),
+            buying_power=equity,
+            pattern_day_trader=False,
+        )
+    )
+    return broker
+
+
+def _make_position(ticker: str, entry_price: Decimal, quantity: Decimal):
+    p = MagicMock()
+    p.ticker = ticker
+    p.entry_price = entry_price
+    p.quantity = quantity
+    return p
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_blocks_overconcentration(evaluator, monkeypatch):
+    """3 ITA positions totaling 22% of 100k equity; new ITA proposal blocked.
+
+    Worst-case projection adds 5% (half-Kelly cap) -> 27% > 25% limit.
+    """
+    equity = Decimal("100000")
+    # 22% of 100k = 22_000 across 3 ITA tickers
+    positions = [
+        _make_position("LMT", Decimal("400"), Decimal("20")),   # 8_000
+        _make_position("RTX", Decimal("100"), Decimal("80")),   # 8_000
+        _make_position("NOC", Decimal("500"), Decimal("12")),   # 6_000
+    ]
+    db = _mock_db_with_positions(positions)
+    broker = _mock_correlation_broker(equity)
+    monkeypatch.setattr("src.scoring.gates.get_broker", lambda: broker)
+
+    signal = _make_raw_signal(ticker="GD")  # Defense -> ITA
+    indicators = IndicatorSnapshot(
+        ticker="GD",
+        computed_at=datetime.now(UTC),
+        price=Decimal("250"),
+    )
+    result = await evaluator._gate_correlation(db, signal, indicators)
+    assert result.gate == GateName.CORRELATION
+    assert result.blocked is True
+    assert "ITA" in result.reason
+    assert result.overrideable is True
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_passes_when_under_limit(evaluator, monkeypatch):
+    """One ITA at 5% of equity; new ITA proposal would be 10% — under 25%."""
+    equity = Decimal("100000")
+    positions = [
+        _make_position("LMT", Decimal("500"), Decimal("10")),  # 5_000 = 5%
+    ]
+    db = _mock_db_with_positions(positions)
+    broker = _mock_correlation_broker(equity)
+    monkeypatch.setattr("src.scoring.gates.get_broker", lambda: broker)
+
+    signal = _make_raw_signal(ticker="RTX")
+    indicators = IndicatorSnapshot(
+        ticker="RTX",
+        computed_at=datetime.now(UTC),
+        price=Decimal("100"),
+    )
+    result = await evaluator._gate_correlation(db, signal, indicators)
+    assert result.blocked is False
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_failopen_when_no_indicators(evaluator):
+    """No indicators -> fail-open (other gates handle missing data as block)."""
+    signal = _make_raw_signal(ticker="LMT")
+    db = MagicMock()  # never touched
+    result = await evaluator._gate_correlation(db, signal, None)
+    assert result.gate == GateName.CORRELATION
+    assert result.blocked is False

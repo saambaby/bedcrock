@@ -189,3 +189,107 @@ def test_spec_from_draft_short():
     assert spec.risk_per_share() == Decimal("15")
     assert spec.reward_per_share() == Decimal("30")
     assert spec.reward_to_risk() == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Half-Kelly position-size cap (V2.7)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock
+
+from src.broker.base import AccountSnapshot
+
+
+def _mock_broker(equity: Decimal):
+    broker = MagicMock()
+    broker.connect = AsyncMock(return_value=None)
+    broker.disconnect = AsyncMock(return_value=None)
+    broker.get_account = AsyncMock(
+        return_value=AccountSnapshot(
+            equity=equity,
+            cash=equity,
+            positions_value=Decimal("0"),
+            buying_power=equity,
+            pattern_day_trader=False,
+        )
+    )
+    return broker
+
+
+def _mock_db():
+    db = MagicMock()
+    db.add = MagicMock()
+    db.commit = AsyncMock(return_value=None)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_position_size_capped_by_concentration(monkeypatch):
+    """Tight stop would yield huge risk-based qty; concentration cap binds at 5%."""
+    broker = _mock_broker(Decimal("100000"))
+    monkeypatch.setattr("src.orders.builder.get_broker", lambda: broker)
+
+    builder = OrderBuilder()
+    draft = await builder.build_draft(
+        ticker="NVDA",
+        side=Action.BUY,
+        entry_zone_low=Decimal("100"),
+        entry_zone_high=Decimal("100"),
+        stop=Decimal("99"),  # 1% stop -> qty_by_risk = 1000 / 1 = 1000
+        target=Decimal("110"),  # rr = 10/1 = 10
+        setup="breakout",
+        score=1.0,
+        source_signal_ids=[],
+        indicators=None,
+        db=_mock_db(),
+    )
+    assert draft is not None
+    # equity * 0.05 / entry = 100_000 * 0.05 / 100 = 50
+    assert draft.quantity == Decimal("50")
+
+
+@pytest.mark.asyncio
+async def test_position_size_unchanged_when_risk_lower(monkeypatch):
+    """Wide stop -> qty_by_risk dominates; concentration cap does not bind."""
+    broker = _mock_broker(Decimal("100000"))
+    monkeypatch.setattr("src.orders.builder.get_broker", lambda: broker)
+
+    builder = OrderBuilder()
+    draft = await builder.build_draft(
+        ticker="NVDA",
+        side=Action.BUY,
+        entry_zone_low=Decimal("100"),
+        entry_zone_high=Decimal("100"),
+        stop=Decimal("80"),  # $20 stop; risk_pct=1% -> dollar_risk=$1000 -> qty=50
+        target=Decimal("160"),  # rr = 60/20 = 3.0
+        setup="breakout",
+        score=1.0,
+        source_signal_ids=[],
+        indicators=None,
+        db=_mock_db(),
+    )
+    assert draft is not None
+    # qty_by_risk = 1000 / 20 = 50
+    # qty_by_concentration = 5000 / 100 = 50
+    # min == 50 either way, but verify with smaller risk pct sanity:
+    # use a much wider stop to be sure risk-bound binds
+    broker2 = _mock_broker(Decimal("1000000"))  # 1M equity
+    monkeypatch.setattr("src.orders.builder.get_broker", lambda: broker2)
+    draft2 = await builder.build_draft(
+        ticker="NVDA",
+        side=Action.BUY,
+        entry_zone_low=Decimal("100"),
+        entry_zone_high=Decimal("100"),
+        stop=Decimal("50"),  # $50 stop; dollar_risk = 10_000 -> qty=200
+        target=Decimal("250"),  # rr = 150/50 = 3
+        setup="breakout",
+        score=1.0,
+        source_signal_ids=[],
+        indicators=None,
+        db=_mock_db(),
+    )
+    assert draft2 is not None
+    # qty_by_risk = 10_000 / 50 = 200
+    # qty_by_concentration = 50_000 / 100 = 500
+    # min = 200 (risk bound)
+    assert draft2.quantity == Decimal("200")
