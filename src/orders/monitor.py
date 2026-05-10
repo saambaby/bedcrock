@@ -1,6 +1,6 @@
 """Live monitor — the always-on listener.
 
-Subscribes to IBKR's order/trade events via ib_insync and translates fills into:
+Subscribes to IBKR's order/trade events via ib_async and translates fills into:
   - Position rows (on entry fills)
   - Closure inbox events (on stop/target fills) — for Cowork's hourly run
   - Discord #position-alerts pings
@@ -42,7 +42,7 @@ logger = get_logger(__name__)
 
 
 class LiveMonitor:
-    """Monitors broker order fills via ib_insync events + polling fallback."""
+    """Monitors broker order fills via ib_async events + polling fallback."""
 
     def __init__(self) -> None:
         self._broker = make_broker()
@@ -82,7 +82,7 @@ class LiveMonitor:
             logger.error("live_monitor_connect_failed", error=str(e))
             return
 
-        # Subscribe to ib_insync events if using IBKR
+        # Subscribe to ib_async events if using IBKR
         if isinstance(self._broker, IBKRBroker):
             ib = self._broker._ib
             ib.orderStatusEvent += self._on_order_status
@@ -99,12 +99,13 @@ class LiveMonitor:
                 await asyncio.sleep(30)
 
         async def _keep_alive():
-            """Keep ib_insync event loop running."""
-            if isinstance(self._broker, IBKRBroker):
-                ib = self._broker._ib
-                while not self._stopped and ib.isConnected():
-                    ib.sleep(1)
-                    await asyncio.sleep(0.1)
+            """ib_async is pure asyncio — no event-loop bridging needed.
+
+            Just keep the task alive so cancellation is observed and we exit
+            cleanly when the broker disconnects.
+            """
+            while not self._stopped and self._broker._ib.isConnected():
+                await asyncio.sleep(5)
 
         poll_task = asyncio.create_task(_poll())
         alive_task = asyncio.create_task(_keep_alive())
@@ -115,7 +116,7 @@ class LiveMonitor:
             logger.info("live_monitor_cancelled")
 
     def _on_order_status(self, trade) -> None:
-        """ib_insync orderStatusEvent callback (sync — schedule async handler)."""
+        """ib_async orderStatusEvent callback (sync — schedule async handler)."""
         if self._db_factory is None:
             return
         status = trade.orderStatus.status.lower() if trade.orderStatus else ""
@@ -123,13 +124,13 @@ class LiveMonitor:
             asyncio.create_task(self._handle_order_status(trade))
 
     def _on_exec_details(self, trade, fill) -> None:
-        """ib_insync execDetailsEvent callback (sync — schedule async handler)."""
+        """ib_async execDetailsEvent callback (sync — schedule async handler)."""
         if self._db_factory is None:
             return
         asyncio.create_task(self._handle_fill(trade, fill))
 
     async def _handle_order_status(self, trade) -> None:
-        """Process order status changes from ib_insync."""
+        """Process order status changes from ib_async."""
         try:
             order = trade.order
             status = trade.orderStatus.status.lower() if trade.orderStatus else ""
@@ -156,7 +157,7 @@ class LiveMonitor:
             logger.error("handle_order_status_failed", error=str(e))
 
     async def _handle_fill(self, trade, fill) -> None:
-        """Process execution details from ib_insync."""
+        """Process execution details from ib_async."""
         try:
             order = trade.order
             execution = fill.execution

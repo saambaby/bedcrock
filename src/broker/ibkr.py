@@ -1,7 +1,7 @@
 """Interactive Brokers adapter — paper and live trading.
 
-Uses `ib_insync` to connect to IB Gateway or TWS. Paper vs live is just a
-different port:
+Uses `ib_async` (the maintained successor to `ib_insync`) to connect to IB
+Gateway or TWS. Paper vs live is just a different port:
   - TWS paper: 7497  |  TWS live: 7496
   - Gateway paper: 4002  |  Gateway live: 4001
 
@@ -17,17 +17,16 @@ Setup:
   4. For paper trading, log in with "Paper Trading" mode
 
 References:
-  - https://ib-insync.readthedocs.io
+  - https://ib-api.readthedocs.io  (ib_async docs)
   - https://interactivebrokers.github.io/tws-api/
 """
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ib_insync import IB, Stock, Trade
+from ib_async import IB, Stock, Trade
 
 from src.broker.base import (
     AccountSnapshot,
@@ -116,8 +115,8 @@ class IBKRBroker(BrokerAdapter):
         try:
             if not self._ib.isConnected():
                 return False
-            # Quick check — request managed accounts
-            await asyncio.to_thread(self._ib.managedAccounts)
+            # Quick check — request managed accounts (sync call, returns cached list)
+            self._ib.managedAccounts()
             return True
         except Exception:
             return False
@@ -126,8 +125,8 @@ class IBKRBroker(BrokerAdapter):
         ib = await self._ensure()
         account = settings.ibkr_account or ""
 
-        # ib_insync accountSummary is synchronous under the hood
-        summary = await asyncio.to_thread(ib.accountSummary, account)
+        # ib_async provides a native async variant
+        summary = await ib.accountSummaryAsync(account)
 
         values: dict[str, str] = {}
         for item in summary:
@@ -162,7 +161,7 @@ class IBKRBroker(BrokerAdapter):
 
         contract = Stock(ticker, "SMART", "USD")
         try:
-            qualified = await asyncio.to_thread(ib.qualifyContracts, contract)
+            qualified = await ib.qualifyContractsAsync(contract)
             if not qualified:
                 raise OrderRejectedError(f"Could not qualify contract for {ticker}")
         except OrderRejectedError:
@@ -188,7 +187,9 @@ class IBKRBroker(BrokerAdapter):
         trades: list[Trade] = []
         try:
             for order in bracket:
-                trade = await asyncio.to_thread(ib.placeOrder, contract, order)
+                # ib_async placeOrder is non-blocking — returns Trade immediately,
+                # async work happens via the event loop.
+                trade = ib.placeOrder(contract, order)
                 trades.append(trade)
         except Exception as e:
             logger.error("ibkr_submit_failed", error=str(e), ticker=ticker)
@@ -216,7 +217,7 @@ class IBKRBroker(BrokerAdapter):
         # Find the order in open orders
         for trade in ib.openTrades():
             if str(trade.order.orderId) == broker_order_id:
-                await asyncio.to_thread(ib.cancelOrder, trade.order)
+                ib.cancelOrder(trade.order)
                 return
         logger.warning("ibkr_cancel_order_not_found", order_id=broker_order_id)
 
@@ -227,7 +228,7 @@ class IBKRBroker(BrokerAdapter):
             if str(trade.order.orderId) == broker_order_id:
                 return self._trade_to_broker_order(trade)
         # Check completed trades
-        fills = await asyncio.to_thread(ib.fills)
+        fills = await ib.reqExecutionsAsync()
         for fill in fills:
             if str(fill.execution.orderId) == broker_order_id:
                 return BrokerOrder(
@@ -244,8 +245,8 @@ class IBKRBroker(BrokerAdapter):
         try:
             ib = await self._ensure()
             contract = Stock(ticker.upper(), "SMART", "USD")
-            await asyncio.to_thread(ib.qualifyContracts, contract)
-            [ticker_data] = await asyncio.to_thread(ib.reqTickers, contract)
+            await ib.qualifyContractsAsync(contract)
+            [ticker_data] = await ib.reqTickersAsync(contract)
             # Use midpoint if available, otherwise last
             if ticker_data.midpoint() and ticker_data.midpoint() == ticker_data.midpoint():
                 return Decimal(str(ticker_data.midpoint()))

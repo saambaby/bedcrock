@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -81,6 +81,16 @@ class Settings(BaseSettings):
     risk_min_adv_usd: float = 5_000_000
     risk_earnings_blackout_days: int = 3
     risk_event_blackout_days: int = 2
+    # v2 (N3): half-Kelly per-position size cap — never more than this fraction
+    # of equity in a single position regardless of how tight the stop is.
+    risk_max_position_size_pct: float = 0.05
+    # v2 (N2): sector concentration limit for the correlation gate.
+    risk_sector_concentration_limit: float = 0.25
+
+    # --- Heavy-movement ingestor (v2, N1) ---
+    movement_volume_spike_threshold: float = 3.0
+    movement_gap_threshold: float = 0.05
+    movement_check_interval_seconds: int = 300
 
     # --- Observability ---
     log_level: str = "INFO"
@@ -100,6 +110,24 @@ class Settings(BaseSettings):
         if "+asyncpg" not in v:
             raise ValueError("DATABASE_URL must use postgresql+asyncpg:// driver")
         return v
+
+    # v2 invariant 9: mode and IBKR port are coupled. Mismatched config
+    # (e.g. MODE=live with the paper port 4002) refuses to boot.
+    @model_validator(mode="after")
+    def _validate_mode_port(self) -> "Settings":
+        valid_paper_ports = {4002, 7497}
+        valid_live_ports = {4001, 7496}
+        if self.mode == Mode.PAPER and self.ibkr_port not in valid_paper_ports:
+            raise ValueError(
+                f"MODE=paper requires IBKR_PORT in {sorted(valid_paper_ports)}, "
+                f"got {self.ibkr_port}. 4002 is IB Gateway paper, 7497 is TWS paper."
+            )
+        if self.mode == Mode.LIVE and self.ibkr_port not in valid_live_ports:
+            raise ValueError(
+                f"MODE=live requires IBKR_PORT in {sorted(valid_live_ports)}, "
+                f"got {self.ibkr_port}. 4001 is IB Gateway live, 7496 is TWS live."
+            )
+        return self
 
     # Convenience properties
 
