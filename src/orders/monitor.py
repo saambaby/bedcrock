@@ -36,6 +36,7 @@ from src.db.models import (
 )
 from src.discord_bot.webhooks import post_position_alert
 from src.logging_config import get_logger
+from src.safety.reconciler import reconcile_against_broker
 from src.vault.writer import write_closure_event, write_position
 
 logger = get_logger(__name__)
@@ -88,6 +89,15 @@ class LiveMonitor:
             ib.orderStatusEvent += self._on_order_status
             ib.execDetailsEvent += self._on_exec_details
             logger.info("live_monitor_subscribed_to_ibkr_events")
+
+            # Startup reconciliation — orphans + stales (audit §3.4 + §3.6).
+            # Must run before _poll/_keep_alive so we cannot race fills against
+            # an unrepaired DB view.
+            try:
+                async with db_factory() as db:
+                    await reconcile_against_broker(self._broker, db)
+            except Exception as e:
+                logger.error("startup_reconcile_failed", error=str(e))
 
         async def _poll():
             while not self._stopped:
