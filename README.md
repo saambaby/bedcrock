@@ -1,8 +1,8 @@
 # Bedcrock
 
-Always-on backend that ingests politician trades, hedge fund filings, insider buys, and options flow; scores them with hard gates; computes an indicator/regime layer per ticker; writes signal `.md` files into your Obsidian vault for Cowork to reason over; and routes one-click bracket orders to a paper or live broker.
+Always-on backend that ingests politician trades, hedge fund filings, insider buys, and options flow; scores them with hard gates; computes an indicator/regime layer per ticker; and emits one-click bracket orders to a paper or live broker via Discord. Reasoning runs on Claude Code Routines that consume the data via a FastAPI read layer.
 
-**Status:** v0.1 — built for paper trading on Interactive Brokers. Same broker for paper and live (just different ports).
+**Status:** v0.3 — built for paper trading on Interactive Brokers. Same broker for paper and live (just different ports).
 
 ## What this is
 
@@ -31,13 +31,31 @@ docker compose up
 #   uvicorn src.api.main:app --host 0.0.0.0 --port 8080
 ```
 
-For production deployment (VPS + Syncthing + systemd), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+For production deployment (VPS + systemd), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+## Reasoning layer (Claude Code Routines)
+
+Bedcrock has no in-process LLM. The backend is a deterministic pipeline (ingest → score → gate → write); reasoning lives in five Claude Code skills under `.claude/skills/`:
+
+- **`morning-analyze/`** — 06:30 ET weekday gameplan: triages overnight signals, picks the day's priority tickers with triggers/stops/targets.
+- **`intraday-check/`** — 12:00 and 14:00 ET reality checks against the morning plan.
+- **`hourly-closure/`** — top-of-hour during market hours: reviews open positions for stop/target/thesis-break exits.
+- **`weekly-synthesis/`** — Sunday 19:00 ET retrospective: what worked, what didn't, what to change.
+- **`status/`** — on-demand health and positions snapshot.
+
+Each skill calls the FastAPI read endpoints (`/dashboard/morning`, `/positions`, etc.) with a bearer token, then posts decisive embeds to the appropriate Discord webhook. Register them as cloud-hosted Routines from a `claude` session in this repo via `/schedule` (one per skill) — see `docs/DEPLOYMENT.md`. Routines run on Anthropic infrastructure against your Pro/Max subscription, not on the VPS.
 
 ## Project layout
 
 ```
 bedcrock/
 ├── alembic/                   # DB migrations
+├── .claude/skills/            # Claude Code Routines (reasoning layer)
+│   ├── morning-analyze/
+│   ├── intraday-check/
+│   ├── hourly-closure/
+│   ├── weekly-synthesis/
+│   └── status/
 ├── src/
 │   ├── config.py              # env loading
 │   ├── db/                    # SQLAlchemy models, async session
@@ -50,19 +68,15 @@ bedcrock/
 │   ├── orders/                # bracket builder, live monitor
 │   ├── safety/                # v2 — startup reconciler (broker truth wins)
 │   ├── backtest/              # v2 N4 — mini-replay for scoring-rule changes
-│   ├── vault/                 # writes .md files into the Obsidian vault
 │   ├── discord_bot/           # webhooks + slash command bot
-│   ├── api/                   # FastAPI: health, /confirm, /skip
+│   ├── api/                   # FastAPI: health, /confirm, /skip, dashboard reads
 │   └── workers/               # process entry points (one per systemd unit)
 │       └── daily_pnl.py       # v2 F5 — populates daily_pnl_pct for kill switch
-├── vault-templates/           # frontmatter templates + 99-Meta seed files
-├── cowork-prompts/            # the four scheduled-task prompts
 ├── deploy/
 │   ├── systemd/               # unit files for VPS deployment
 │   └── docker/                # Dockerfile
 └── docs/
     ├── DEPLOYMENT.md
-    ├── COWORK_INTEGRATION.md
     ├── DISCORD_SETUP.md
     ├── BROKER_SETUP.md
     ├── ENV.md
@@ -74,13 +88,12 @@ bedcrock/
 These come from the plan and are enforced in code:
 
 1. **Paper and live share one path.** Differs only by `mode` env var and broker adapter selection.
-2. **The vault is the source of truth.** The DB is a fast cache; if it disappears, you can rebuild from the vault.
-3. **Inbox-then-process.** Backend writes only to `00 Inbox/`. Cowork writes everywhere else.
-4. **Humans confirm entries; the broker enforces exits.** Server-side OCO at the broker. Bot never opens positions without your `/confirm`.
-5. **No mocks in prod.** All ingestors talk to real endpoints. Tests use VCR cassettes against real responses, not hand-written fakes.
-6. **Broker truth wins on conflict.** (v2) On startup or post-disconnect reconnect, IBKR's view of positions and open orders is the source of truth; the DB is repaired to match, with an audit-log entry per repair.
-7. **Stops are GTC by construction.** (v2) No code path may submit a child order with `tif != "GTC"`. The reconciler audit re-issues any non-conforming order found on the wire.
-8. **Mode and port are coupled.** (v2) `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`; `MODE=live` requires `{4001, 7496}`. Mismatched config refuses to boot.
+2. **Postgres is the canonical store; Claude Code skills are the reasoning surface; Discord is the alert + control plane; broker (IBKR) is the source of truth for live positions and open orders.**
+3. **Humans confirm entries; the broker enforces exits.** Server-side OCO at the broker. Bot never opens positions without your `/confirm`.
+4. **No mocks in prod.** All ingestors talk to real endpoints. Tests use VCR cassettes against real responses, not hand-written fakes.
+5. **Broker truth wins on conflict.** (v2) On startup or post-disconnect reconnect, IBKR's view of positions and open orders is the source of truth; the DB is repaired to match, with an audit-log entry per repair.
+6. **Stops are GTC by construction.** (v2) No code path may submit a child order with `tif != "GTC"`. The reconciler audit re-issues any non-conforming order found on the wire.
+7. **Mode and port are coupled.** (v2) `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`; `MODE=live` requires `{4001, 7496}`. Mismatched config refuses to boot.
 
 ## Audit trail
 
