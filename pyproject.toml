@@ -37,8 +37,7 @@ dependencies = [
     "numpy>=1.26.0",
     "pandas-ta>=0.3.14b0",
 
-    # --- Vault / Markdown ---
-    "python-frontmatter>=1.1.0",
+    # --- YAML (scoring rules, etc.) ---
     "pyyaml>=6.0.1",
 
     # --- Discord ---
