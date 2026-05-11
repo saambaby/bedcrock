@@ -5,9 +5,13 @@ Runs once per US trading day, after the close (default 16:30 ET):
   1. Fetch broker account snapshot (equity, cash, positions value)
   2. Compute daily P&L delta from yesterday's snapshot
   3. Persist EquitySnapshot row
-  4. Compute SPY benchmark return (for that day) — for relative comparison
-  5. Write 05 Daily/{YYYY-MM-DD}.md with positions + P&L + signal cluster
-  6. Post #system-health summary to Discord
+  4. Sunday only: scan pending ScoringProposal rows, run replay() per proposal,
+     persist a ScoringReplayReport row and link it back to the proposal.
+  5. Post #system-health EOD summary embed to Discord
+
+v0.3.0 dropped all markdown / file-tree writes. The canonical store is Postgres; the reasoning
+surface is Claude Code Routines reading via FastAPI; Discord is the alert and
+control plane.
 
 Cron: 30 16 * * 1-5 (4:30 PM ET, weekdays). Or run via `python -m src.workers.eod_worker`.
 """
@@ -17,19 +21,21 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
 
-import yaml
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.backtest.replay import ReplayReport, replay
+from src.backtest.replay import replay
 from src.broker import get_broker
 from src.config import settings
 from src.db.models import (
+    DraftOrder,
     EquitySnapshot,
+    OrderStatus,
     Position,
     PositionStatus,
+    ScoringProposal,
+    ScoringReplayReport,
     Signal,
 )
 from src.db.session import SessionLocal, dispose
@@ -100,7 +106,7 @@ async def main() -> None:
         await db.execute(stmt)
         await db.commit()
 
-        # Pull today's open positions and signals for the daily note
+        # Pull today's open positions and signals for the EOD summary
         open_positions = (await db.execute(
             select(Position).where(
                 Position.status == PositionStatus.OPEN,
@@ -115,35 +121,38 @@ async def main() -> None:
             )
         )).scalars().all()
 
-    write_daily_note(
-        date=today,
-        equity=account.equity,
-        cash=account.cash,
-        daily_pnl=daily_pnl,
-        daily_pnl_pct=daily_pnl_pct,
-        open_positions=open_positions,
-        signal_count=len(today_signals),
-    )
+        # Today's draft orders, broken out by lifecycle status for the summary.
+        today_drafts = (await db.execute(
+            select(DraftOrder).where(
+                DraftOrder.created_at >= today_dt,
+                DraftOrder.mode == settings.mode,
+            )
+        )).scalars().all()
 
-    color = COLOR_INFO
+    drafts_created = len(today_drafts)
+    drafts_confirmed = sum(
+        1 for d in today_drafts
+        if d.status in (OrderStatus.SENT, OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+    )
+    drafts_skipped = sum(1 for d in today_drafts if d.status == OrderStatus.SKIPPED)
+
     desc = (
         f"**Equity:** ${account.equity:,.2f}\n"
         f"**Daily P&L:** ${daily_pnl:,.2f} ({daily_pnl_pct:.2f}%)\n"
         f"**Open positions:** {len(open_positions)}\n"
-        f"**New signals today:** {len(today_signals)}\n"
+        f"**Signals today:** {len(today_signals)}\n"
+        f"**Drafts:** {drafts_created} created / {drafts_confirmed} confirmed / {drafts_skipped} skipped\n"
     )
     await post_system_health(
-        title=f"📊 EOD — {today.isoformat()} ({settings.mode.value})",
+        title=f"EOD — {today.isoformat()} ({settings.mode.value})",
         description=desc,
-        color=color,
+        color=COLOR_INFO,
     )
 
-    # Sunday 17:00 ET (UTC weekday 6) — run mini-backtester replay against any
-    # proposed scoring-rule weight sets in the vault, write reports for the
-    # weekly synthesis to consume.
+    # Sunday (UTC weekday 6) — replay any pending scoring proposals.
     if datetime.now(UTC).weekday() == 6:
         try:
-            await run_weekly_replay(today)
+            await run_weekly_replay()
         except Exception as e:
             logger.error("weekly_replay_failed", error=str(e))
 
@@ -151,159 +160,65 @@ async def main() -> None:
     logger.info("eod_worker_done")
 
 
-async def run_weekly_replay(today) -> None:
-    """Read 99 Meta/scoring-rules-proposed.md, run replay() per proposal,
-    write 06 Weekly/{date}-replay-{rule_name}.md for each."""
-    proposals_path = settings.vault_path / "99 Meta" / "scoring-rules-proposed.md"
-    if not proposals_path.exists():
-        logger.info("weekly_replay_no_proposals", path=str(proposals_path))
-        return
+async def run_weekly_replay() -> None:
+    """For each `ScoringProposal` row with status='pending', run `replay()` and
+    persist a `ScoringReplayReport`. Link the report back to the proposal via
+    `replay_report_id` and stamp `evaluated_at`.
 
-    proposals = _parse_proposed_rules(proposals_path)
-    if not proposals:
-        logger.info("weekly_replay_empty_proposals")
-        return
-
-    out_dir = settings.vault_path / "06 Weekly"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    Replaces the v0.2 markdown flow (read a proposed-rules note, write a
+    per-rule replay note). Source of truth is now the
+    `scoring_proposals` and `scoring_replay_reports` tables.
+    """
     async with SessionLocal() as db:
-        for rule_name, weights in proposals.items():
-            logger.info("weekly_replay_running", rule=rule_name)
+        pending_stmt = (
+            select(ScoringProposal)
+            .where(ScoringProposal.status == "pending")
+            .order_by(ScoringProposal.proposed_at.asc())
+        )
+        proposals = (await db.execute(pending_stmt)).scalars().all()
+
+        if not proposals:
+            logger.info("weekly_replay_no_pending_proposals")
+            return
+
+        logger.info("weekly_replay_starting", n_pending=len(proposals))
+
+        for proposal in proposals:
+            weights = {k: float(v) for k, v in (proposal.weights or {}).items()}
+            if not weights:
+                logger.warning(
+                    "weekly_replay_skipping_empty_weights", proposal_id=str(proposal.id)
+                )
+                continue
+
+            logger.info("weekly_replay_running", proposal_id=str(proposal.id))
             report = await replay(db, weights)
-            out_path = out_dir / f"{today.isoformat()}-replay-{rule_name}.md"
-            out_path.write_text(_format_replay_note(rule_name, weights, report), encoding="utf-8")
-            logger.info(
-                "weekly_replay_written",
-                rule=rule_name,
-                path=str(out_path),
+
+            replay_row = ScoringReplayReport(
+                proposal_id=proposal.id,
+                in_sample_sharpe=float(report.in_sample_sharpe),
+                out_of_sample_sharpe=float(report.out_of_sample_sharpe),
+                win_rate=float(report.win_rate),
+                profit_factor=float(report.profit_factor),
+                total_return_pct=float(report.total_return_pct),
+                sharpe_delta_vs_baseline=float(report.sharpe_delta_vs_baseline),
                 recommendation=report.recommendation,
             )
+            db.add(replay_row)
+            await db.flush()  # populate replay_row.id
 
+            proposal.replay_report_id = replay_row.id
+            proposal.evaluated_at = datetime.now(UTC)
+            # Status remains 'pending' until a human reviews + accepts/rejects.
 
-def _parse_proposed_rules(path: Path) -> dict[str, dict]:
-    """Parse the proposals markdown file. Supports either:
+            await db.commit()
 
-    1. A YAML frontmatter block with `proposals: {name: {weights}}`, or
-    2. One or more fenced ```yaml blocks, each containing
-       `name: <rule_name>` and `weights: {...}`.
-
-    Returns {rule_name: weights_dict}. Empty dict if nothing parseable.
-    """
-    text = path.read_text(encoding="utf-8")
-    proposals: dict[str, dict] = {}
-
-    # Frontmatter form
-    if text.startswith("---\n"):
-        try:
-            _, fm, _ = text.split("---\n", 2)
-            data = yaml.safe_load(fm) or {}
-            for name, cfg in (data.get("proposals") or {}).items():
-                weights = cfg.get("weights") if isinstance(cfg, dict) else None
-                if isinstance(weights, dict):
-                    proposals[str(name)] = {k: float(v) for k, v in weights.items()}
-        except Exception as e:
-            logger.warning("weekly_replay_frontmatter_parse_failed", error=str(e))
-
-    # Fenced YAML blocks
-    in_block = False
-    buf: list[str] = []
-    for line in text.splitlines():
-        if line.strip().startswith("```yaml") or line.strip() == "```yml":
-            in_block = True
-            buf = []
-            continue
-        if in_block and line.strip() == "```":
-            in_block = False
-            try:
-                data = yaml.safe_load("\n".join(buf)) or {}
-                name = data.get("name")
-                weights = data.get("weights")
-                if name and isinstance(weights, dict):
-                    proposals[str(name)] = {k: float(v) for k, v in weights.items()}
-            except Exception as e:
-                logger.warning("weekly_replay_block_parse_failed", error=str(e))
-            continue
-        if in_block:
-            buf.append(line)
-
-    return proposals
-
-
-def _format_replay_note(rule_name: str, weights: dict, report: ReplayReport) -> str:
-    fm = {
-        "type": "replay-report",
-        "rule_name": rule_name,
-        "recommendation": report.recommendation,
-        "in_sample_sharpe": report.in_sample_sharpe,
-        "out_of_sample_sharpe": report.out_of_sample_sharpe,
-        "sharpe_delta_vs_baseline": report.sharpe_delta_vs_baseline,
-        "n_trades_simulated": report.n_trades_simulated,
-        "win_rate": report.win_rate,
-        "profit_factor": report.profit_factor,
-        "total_return_pct": report.total_return_pct,
-    }
-    body = (
-        f"# Replay — {rule_name}\n\n"
-        f"**Recommendation:** {report.recommendation}\n\n"
-        f"## Proposed weights\n\n```yaml\n"
-        f"{yaml.safe_dump(weights, sort_keys=False)}```\n\n"
-        f"## Metrics\n\n"
-        f"- Signals in scope: {report.n_signals_in_scope}\n"
-        f"- Above threshold (proposed): {report.n_signals_above_threshold}\n"
-        f"- Trades simulated: {report.n_trades_simulated}\n"
-        f"- In-sample Sharpe: {report.in_sample_sharpe:.3f}\n"
-        f"- Out-of-sample Sharpe: {report.out_of_sample_sharpe:.3f}\n"
-        f"- Sharpe Δ vs baseline: {report.sharpe_delta_vs_baseline:+.3f}\n"
-        f"- Win rate (OOS): {report.win_rate:.1%}\n"
-        f"- Profit factor (OOS): {report.profit_factor:.2f}\n"
-        f"- Total return % (OOS, qty=1): {report.total_return_pct:+.2f}\n\n"
-        f"_Advisory only. See `src/backtest/replay.py` module docstring for caveats._\n"
-    )
-    return "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n" + body
-
-
-def write_daily_note(
-    *,
-    date,
-    equity: Decimal,
-    cash: Decimal,
-    daily_pnl: Decimal,
-    daily_pnl_pct: Decimal,
-    open_positions: list,
-    signal_count: int,
-) -> Path:
-    """Write the 05 Daily/{date}.md note. Cowork's morning prompt reads this."""
-    base = settings.vault_path / "05 Daily"
-    base.mkdir(parents=True, exist_ok=True)
-    path = base / f"{date.isoformat()}.md"
-
-    fm = {
-        "type": "daily",
-        "mode": settings.mode.value,
-        "date": date.isoformat(),
-        "equity": float(equity),
-        "cash": float(cash),
-        "daily_pnl": float(daily_pnl),
-        "daily_pnl_pct": float(daily_pnl_pct),
-        "open_positions_count": len(open_positions),
-        "signal_count": signal_count,
-    }
-    body = (
-        f"# {date.isoformat()} — Daily ({settings.mode.value})\n\n"
-        f"**Equity:** ${equity:,.2f}\n"
-        f"**Daily P&L:** ${daily_pnl:,.2f} ({daily_pnl_pct:.2f}%)\n\n"
-        f"## Open Positions ({len(open_positions)})\n\n"
-    )
-    for p in open_positions:
-        body += f"- [[02 Open Positions/{p.ticker}-{p.entry_at.strftime('%Y-%m-%d')}|{p.ticker}]] — {p.side.value} @ ${p.entry_price}\n"
-    body += f"\n## Signals today: {signal_count}\n"
-
-    path.write_text(
-        "---\n" + yaml.safe_dump(fm, sort_keys=False) + "---\n" + body,
-        encoding="utf-8",
-    )
-    return path
+            logger.info(
+                "weekly_replay_persisted",
+                proposal_id=str(proposal.id),
+                report_id=str(replay_row.id),
+                recommendation=report.recommendation,
+            )
 
 
 async def write_start_of_day_snapshot() -> None:
