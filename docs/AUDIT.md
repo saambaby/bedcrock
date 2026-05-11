@@ -12,7 +12,7 @@ Reviewed: 2026-05-03
 
 **Solid**
 
-- `src/config.py` reads `.env` via Pydantic Settings. Validates `DATABASE_URL` uses `+asyncpg` and `VAULT_PATH` is absolute — these were the two failure modes in the planning doc's risk register.
+- `src/config.py` reads `.env` via Pydantic Settings. Validates `DATABASE_URL` uses `+asyncpg` and (historically, v0.1/0.2) that `VAULT_PATH` is absolute — these were the two failure modes in the planning doc's risk register. (v0.3.0 dropped `VAULT_PATH` entirely — see the v3-status appendix.)
 - `src/db/models.py` covers every entity from plan §5: Trader, Signal, Indicators, EarningsCalendar, DraftOrder, Position, EquitySnapshot, Snooze, IngestorHeartbeat, AuditLog. All enums (`Mode`, `SignalSource`, `SignalStatus`, `Action`, `GateName`, `OrderStatus`, `PositionStatus`, `CloseReason`) match the plan.
 - The Mode tag (`paper`|`live`|`baseline`) on every relevant table means paper and live records coexist for side-by-side comparison — the plan's invariant #1.
 - Alembic migration `0001_initial.py` matches models 1:1.
@@ -23,7 +23,7 @@ Reviewed: 2026-05-03
 
 **Deferred**
 
-- Rehydrate worker that rebuilds DB from vault. Not v0.1; if DB is wiped, you re-run alembic and the next ingest cycles repopulate.
+- ~~Rehydrate worker that rebuilds DB from vault.~~ Obsolete in v0.3.0 — vault layer was deleted; if DB is wiped, you re-run alembic and the next ingest cycles repopulate (Postgres is the single source of truth).
 - Per-trader size percentile backfill (used by scorer's `size` component). Currently uses a flat $50k threshold heuristic.
 
 ---
@@ -46,7 +46,7 @@ Reviewed: 2026-05-03
 **Gap**
 
 - SEC EDGAR Form 4 ingestor relies on `efts.sec.gov`'s search response shape. SEC has changed this twice in 5 years; if it breaks the symptom is "zero new SEC signals for >6h." The heartbeat alert covers this.
-- Unusual Whales `MIN_PREMIUM` filter is hardcoded at $100k. This should move to `99 Meta/scoring-rules.md` as a tunable.
+- Unusual Whales `MIN_PREMIUM` filter is hardcoded at $100k. This should move to a runtime-tunable setting (originally planned for `99 Meta/scoring-rules.md` in the vault era; now would land as a `scoring_proposals` row or a settings table column).
 - IV percentile (`iv_percentile_30d` field on Indicators) is always `None` in v0.1 — the UW ingestor doesn't populate it. Indicator computer leaves it null; the scorer doesn't depend on it yet.
 
 **Deferred to v0.2**
@@ -69,7 +69,7 @@ Reviewed: 2026-05-03
 **Gap**
 
 - Compute is on-demand (per-ticker, per-signal). No daily batch refresh. With 60-90 unique tickers per day this works fine; if signal volume scales to 500+ tickers we'll need to batch.
-- Setup hint (`breakout`/`pullback`/`base`/`mean_reversion`) is left at `none` — the plan calls for Cowork's morning prompt to interpret structure manually rather than auto-tag.
+- Setup hint (`breakout`/`pullback`/`base`/`mean_reversion`) is left at `none` — the morning reasoning pass interprets structure manually rather than auto-tag (v0.1/0.2: Cowork's morning prompt; v0.3.0: the `morning-analyze` Claude Code skill).
 
 **Deferred**
 
@@ -127,13 +127,13 @@ Reviewed: 2026-05-03
 - `OrderBuilder` validates: stop on correct side of entry, ATR-floor (auto-widens stops < 1.5×ATR), R:R ≥ 1.5, position size > 0.
 - Risk-based sizing: `qty = (equity × risk_pct/100) / |entry - stop|`.
 - `LiveMonitor` subscribes to IBKR's `orderStatusEvent` + `execDetailsEvent` for instant fill notifications + 30s polling fallback for missed events.
-- Closures fire a Discord alert AND drop a closure event in `00 Inbox/` for the hourly Cowork run.
+- Closures fire a Discord alert. (v0.1/0.2 also dropped a closure event in `00 Inbox/` for the hourly Cowork run; in v0.3.0 the hourly-closure skill polls the dashboard endpoint instead — vault writes are gone.)
 
 **Gap**
 
 - The polling fallback (`_reconcile_orders`) only catches FILLED state. If a draft is REJECTED while the WS is offline, the DB row stays in SENT until the next websocket reconnect.
 - Fill events rely on `orderRef` matching the draft UUID. If the ref is lost (e.g. IB Gateway restart mid-order), the polling fallback catches it via `broker_order_id`.
-- `setup_at_entry` is set on the Position row from the DraftOrder, but the order builder never gets the setup string from anywhere — the human or Cowork would need to set it on the draft at confirm time. **Currently null** in v0.1.
+- `setup_at_entry` is set on the Position row from the DraftOrder, but the order builder never gets the setup string from anywhere — the human (or, in v0.1/0.2, Cowork) would need to set it on the draft at confirm time. **Currently null** in v0.1.
 
 **Deferred**
 
@@ -145,17 +145,21 @@ Reviewed: 2026-05-03
 
 ## Vault writer
 
-**Solid**
+> **Obsolete in v0.3.0.** The vault writer (`src/vault/`) was deleted; reasoning
+> migrated to Claude Code Routines + FastAPI dashboard endpoints. The historical
+> notes below describe the v0.1/0.2 design only.
+
+**Solid (historical, v0.1/0.2)**
 
 - Writes only to `00 Inbox/`, `02 Open Positions/`, `03 Closed/` per plan invariant #2 (inbox-then-process).
 - Frontmatter is YAML-safe; bodies are templated markdown.
-- Filename conventions match the plan: `<date>-<TICKER>-<source>.md` for signals, `<TICKER>-<entry-date>.md` for positions, etc.
+- Filename conventions: `<date>-<TICKER>-<source>.md` for signals, `<TICKER>-<entry-date>.md` for positions.
 - Closure event has `urgent: true` frontmatter so the hourly Cowork run can prioritize.
 
-**Gap**
+**Gap (historical)**
 
-- No vault → DB rehydrate. If you delete a position file, the DB row stays. Weekly synthesis is supposed to detect drift.
-- No file lock when writing — if the backend writes while Syncthing is mid-replicate, you can get a `.sync-conflict-` file. Rare; documented in COWORK_INTEGRATION.md.
+- No vault → DB rehydrate. (Moot in v0.3.0 — Postgres is the only source of truth.)
+- No file lock when writing — if the backend writes while Syncthing is mid-replicate, you can get a `.sync-conflict-` file. (Moot in v0.3.0.)
 
 ---
 
@@ -209,15 +213,22 @@ Reviewed: 2026-05-03
 
 ## Cowork integration
 
-**Solid**
+> **Replaced in v0.3.0.** Cowork prompts were retired in favour of five Claude
+> Code skills (`morning-analyze`, `intraday-check`, `hourly-closure`,
+> `weekly-synthesis`, `status`) under `.claude/skills/`, fired by Claude Code
+> Routines (`/schedule`) on the same cadence. Skills hit the FastAPI
+> `/dashboard/*` endpoints — no shared filesystem required. The historical
+> notes below describe the v0.1/0.2 design only.
+
+**Solid (historical, v0.1/0.2)**
 
 - Four prompts cover the full operating cadence (morning heavy, intraday light, hourly closure, weekly synthesis).
-- Strict separation: backend writes inbox, Cowork writes watchlist + analysis. Documented in COWORK_INTEGRATION.md.
+- Strict separation: backend writes inbox, Cowork writes watchlist + analysis. (Documented in the now-deleted `COWORK_INTEGRATION.md`.)
 - Vault-as-source-of-truth means Cowork on a different host can fully reason without backend access.
 
-**Gap**
+**Gap (historical)**
 
-- The "promote to ACT-TODAY" hand-off relies on the human seeing the morning brief and choosing to confirm — there's no auto-create-draft path. **By design** per plan invariant #4 (humans confirm entries).
+- The "promote to ACT-TODAY" hand-off relies on the human seeing the morning brief and choosing to confirm — there's no auto-create-draft path. **By design** per plan invariant #4 (humans confirm entries). Carries forward to v0.3.0.
 
 ---
 
@@ -230,7 +241,7 @@ No test suite in v0.1. The components most worth testing are:
 1. `Scorer.score()` — pure, easy to unit test
 2. `Gate` classes — straightforward with mock contexts
 3. `OrderBuilder.build_draft()` — validation logic for stop side, R:R, ATR floor
-4. Vault frontmatter round-trip
+4. ~~Vault frontmatter round-trip~~ (obsolete in v0.3.0)
 
 These are all on the v0.1.1 backlog. The risk of shipping without them is mitigated by:
 - Paper-only mode for the first 90 days
@@ -257,7 +268,7 @@ v0.1 is **paper-ready**. It can:
 - monitor live fills via WS + polling fallback
 - post to 4 Discord channels
 - accept human confirm/skip via Discord or signed deep link
-- write to a structured Obsidian vault for Cowork to reason over
+- write to a structured Obsidian vault for Cowork to reason over (historical v0.1; deleted in v0.3.0 — reasoning now via Claude Code Routines hitting FastAPI dashboard endpoints)
 
 It is **paper-ready on IBKR**. To go live, meet the plan §9 graduation criteria (Sharpe > 1.0, 50+ closed trades, 90 days), then switch `IBKR_PORT` to 4001 and `MODE=live`.
 
@@ -276,7 +287,7 @@ This pass merged two parallel build threads into one consistent codebase:
 - `src/indicators/__init__.py` — exports both `SECTOR_ETF` (the actual dict) and `DEFAULT_SECTOR_ETFS` (alias).
 - `src/discord_bot/webhooks.py` — rewritten with the kwarg-shaped functions the workers call (`post_firehose(ticker=..., action=..., source=..., score=...)`, `post_high_score(...with breakdown and draft_id)`, `post_system_health(title=..., body=..., ok=...)`). Adds `HIGH_SCORE_THRESHOLD = 6.0` constant and `post_firehose_signal` alias.
 - `src/discord_bot/bot.py` — added `async def run()` entry point so `bot_worker.py` can `from src.discord_bot.bot import run as run_bot`.
-- `src/vault/writer.py` — appended sync wrapper functions (`write_signal`, `write_position`, `write_closure_event`, `write_draft_order`, `ensure_vault_layout`) that delegate to `VaultWriter` class methods. Lets monitor.py and other older callers use the function-style API.
+- `src/vault/writer.py` — (historical, v0.1/0.2 only; deleted in v0.3.0) appended sync wrapper functions (`write_signal`, `write_position`, `write_closure_event`, `write_draft_order`, `ensure_vault_layout`) that delegate to `VaultWriter` class methods. Let monitor.py and other older callers use the function-style API.
 
 **Verification results:**
 
@@ -286,7 +297,7 @@ This pass merged two parallel build threads into one consistent codebase:
 
 **Files NOT touched in this pass (existing build was already correct):**
 
-`src/config.py`, `src/db/models.py`, `src/logging_config.py`, `src/schemas/__init__.py` (the comprehensive Pydantic version with `RawSignal`, `ScoredSignal`, `ScoreBreakdown`, `GateResult`, `IndicatorSnapshot`, `BracketOrderSpec`, `FillEvent`, `DraftOrderPayload`, etc.), `src/scoring/scorer.py`, `src/scoring/gates.py` (existing `GateEvaluator` class), `src/indicators/compute.py`, all 5 ingestors, `src/api/main.py`, all 6 workers, `src/vault/writer.py` (existing `VaultWriter` class), all 4 cowork prompts, all 6 vault-templates, all 5 systemd units, all 6 docs files, all 3 test files, `pyproject.toml`, `docker-compose.yml`, `alembic/versions/0001_initial.py`.
+`src/config.py`, `src/db/models.py`, `src/logging_config.py`, `src/schemas/__init__.py` (the comprehensive Pydantic version with `RawSignal`, `ScoredSignal`, `ScoreBreakdown`, `GateResult`, `IndicatorSnapshot`, `BracketOrderSpec`, `FillEvent`, `DraftOrderPayload`, etc.), `src/scoring/scorer.py`, `src/scoring/gates.py` (existing `GateEvaluator` class), `src/indicators/compute.py`, all 5 ingestors, `src/api/main.py`, all 6 workers, `src/vault/writer.py` (existing `VaultWriter` class — since deleted in v0.3.0), all 4 cowork prompts (since deleted in v0.3.0), all 6 vault-templates (since deleted in v0.3.0), all 5 systemd units, all 6 docs files, all 3 test files, `pyproject.toml`, `docker-compose.yml`, `alembic/versions/0001_initial.py`.
 
 **Known minor inconsistencies remaining (low priority):**
 
@@ -318,4 +329,28 @@ The 2026-05-10 audit (`docs/AUDIT_2026-05-10.md`) surfaced 6 blockers (F1–F6) 
 
 The canonical spec at `bedcrock-plan.md` is now `status: active, version: v2` and reflects v0.2.0 reality. v2 also added three new safety invariants (broker-truth-wins, GTC-by-construction, mode↔port coupled) — see `bedcrock-plan.md` §2 and Appendix C (Version history).
 
-**Test status at merge candidate:** 118 of 123 tests pass. The 5 failing tests are all in `tests/test_vault.py` and predate v2 (they exercise a real `VaultWriter` that's not present on this branch tree — tracked as a v0.1 issue, not in v2 scope).
+**Test status at merge candidate:** 118 of 123 tests pass. The 5 failing tests are all in `tests/test_vault.py` and predate v2 (they exercise a real `VaultWriter` that's not present on this branch tree — tracked as a v0.1 issue, not in v2 scope). **(Resolved in v0.3.0: `tests/test_vault.py` was deleted with the rest of the vault layer.)**
+
+---
+
+## v3 status (2026-05-11)
+
+v0.3.0 was a single-purpose refactor: **delete the vault layer, retire Cowork
+prompts, and migrate reasoning to Claude Code Routines + FastAPI dashboard
+endpoints.** Driver: the user has no Obsidian Sync / Syncthing setup, so a
+VPS-side vault was never accessible from phone or laptop, and the vault writer
+had silently been no-op stubs since v0.1. Postgres is now the single source
+of truth.
+
+| Item | Description | Landing commit |
+|---|---|---|
+| Drop `vault_path` from config + `Signal`/`Position` models | Removed `VAULT_PATH` Field, `_vault_path_absolute` validator, and the two `vault_path` columns | `53daf1b` |
+| Alembic 0003 — drop vault columns + add scoring tables | Drops `signals.vault_path` and `positions.vault_path`; adds `scoring_proposals` + `scoring_replay_reports` for the weekly-synthesis skill | `db0d226` |
+| Delete `src/vault/` + fix call sites | Removed writer/frontmatter modules; pruned imports + write calls from `ingest_worker` and `orders/monitor`; deleted `tests/test_vault.py` | `16f4de8` |
+| EOD worker — drop vault writes, persist replay reports to DB | `write_daily_note` removed; weight proposals now read from `scoring_proposals` table; EOD summary posts to Discord | `7281b1e` |
+| Five Claude Code skills replace four Cowork prompts | `morning-analyze`, `intraday-check`, `hourly-closure`, `weekly-synthesis`, `status` under `.claude/skills/` — fired by `claude.ai/code/routines` cron | `1686ae1` |
+| FastAPI `/dashboard/*` + `/scoring-proposals` | Read endpoints the skills hit via `curl` with `API_BEARER_TOKEN`; weekly synthesis POSTs proposed weights | `05ec4e9` |
+| Remove `cowork-prompts/`, `vault-templates/`, vault deps | Both directories deleted; `python-frontmatter` and related deps dropped from `pyproject.toml` | `2bc01d1` |
+
+For the v0.3.0 architecture rationale and the per-wave plan, see Appendix C in
+`bedcrock-plan.md` and the `v3-staging` branch history.

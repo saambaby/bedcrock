@@ -249,10 +249,10 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 **Scope:**
 1. **New file** `src/backtest/__init__.py` (empty `__init__`).
 2. **New file** `src/backtest/replay.py` containing `ReplayReport` dataclass + `replay()` function + helpers (`_simulate_trade`, `_sharpe`, `_profit_factor`, `_score_signal`). Code reference: `bedcrock-plan.md §V2.8`.
-3. `src/workers/eod_worker.py` — add a task that runs at Sunday 17:00 ET (1 hour before Cowork's weekly synthesis):
-   - Read `99 Meta/scoring-rules-proposed.md` (use existing vault reader if available, else simple file read + YAML parse).
+3. `src/workers/eod_worker.py` — add a task that runs at Sunday 17:00 ET (1 hour before the weekly-synthesis skill runs):
+   - Read pending weight proposals from the `scoring_proposals` DB table (v0.3.0 removed the vault layer entirely; see Appendix C in `bedcrock-plan.md`).
    - For each proposed weight set, call `replay(db, proposed_weights)`.
-   - Write `ReplayReport` to `06 Weekly/{date}-replay-{rule_name}.md` so Cowork's synthesis can read it.
+   - Persist `ReplayReport` to the `scoring_replay_reports` DB table so the weekly-synthesis skill can read it via the dashboard API.
 4. **Caveat doc** at top of `src/backtest/replay.py` listing limitations: OHLCV-only (no bid/ask), constant slippage, no survivorship correction, advisory only.
 
 **Tests in branch (`tests/test_backtester.py` — new file):**
