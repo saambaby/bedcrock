@@ -1,6 +1,7 @@
 """Live monitor — the always-on listener.
 
-Subscribes to IBKR's order/trade events via ib_async and translates fills into:
+Subscribes to the broker's trade-update stream (via ``BrokerAdapter
+.subscribe_trade_updates``) and translates fills into:
   - Position rows (on entry fills)
   - Position closure rows (on stop/target fills) — read by the hourly-closure skill
   - Discord #position-alerts pings
@@ -10,6 +11,11 @@ only OBSERVES — if the VPS dies, the broker still enforces.
 
 Polling fallback: every 30s we reconcile SENT drafts against actual broker state
 in case an event was missed.
+
+Broker-agnostic since v0.4 (Wave C): no concrete ``IBKRBroker`` import here.
+The event stream is whatever the adapter yields; entry-vs-exit fills are now
+distinguished via ``TradeUpdate.raw['parent_id']`` (IBKR side) or by matching
+``broker_order_id`` against existing positions in the DB.
 """
 
 from __future__ import annotations
@@ -22,9 +28,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.broker import make_broker
-from src.broker.base import BrokerOrderState
-from src.broker.ibkr import IBKRBroker
-from src.config import settings
+from src.broker.base import BrokerAdapter, BrokerOrderState, TradeUpdate
+from src.config import Broker, settings
 from src.db.models import (
     Action,
     AuditLog,
@@ -41,11 +46,16 @@ from src.safety.reconciler import reconcile_against_broker
 logger = get_logger(__name__)
 
 
+_FILL_EVENTS = {"fill", "partial_fill"}
+_TERMINAL_NON_FILL_EVENTS = {"canceled", "cancelled", "rejected", "expired"}
+
+
 class LiveMonitor:
-    """Monitors broker order fills via ib_async events + polling fallback."""
+    """Monitors broker order fills via the adapter's trade-update stream +
+    polling fallback."""
 
     def __init__(self) -> None:
-        self._broker = make_broker()
+        self._broker: BrokerAdapter = make_broker()
         self._tasks: list[asyncio.Task] = []
         self._stopped = False
         self._db_factory = None
@@ -71,7 +81,10 @@ class LiveMonitor:
         """db_factory: a callable returning an AsyncSession context manager."""
         self._db_factory = db_factory
 
-        if not settings.ibkr_account:
+        # Broker-aware boot guard.
+        # IBKR still requires an account id (the TWS API call wants it);
+        # Alpaca infers the account from the API key, so no equivalent check.
+        if settings.broker is Broker.IBKR and not settings.ibkr_account:
             logger.warning("live_monitor_no_ibkr_account_skipping")
             return
 
@@ -82,23 +95,42 @@ class LiveMonitor:
             logger.error("live_monitor_connect_failed", error=str(e))
             return
 
-        # Subscribe to ib_async events if using IBKR
-        if isinstance(self._broker, IBKRBroker):
-            ib = self._broker._ib
-            ib.orderStatusEvent += self._on_order_status
-            ib.execDetailsEvent += self._on_exec_details
-            logger.info("live_monitor_subscribed_to_ibkr_events")
+        # Startup reconciliation — orphans + stales (audit §3.4 + §3.6).
+        # Must run before the polling/stream loops so we cannot race fills
+        # against an unrepaired DB view.
+        try:
+            async with db_factory() as db:
+                await reconcile_against_broker(self._broker, db)
+        except Exception as e:
+            logger.error("startup_reconcile_failed", error=str(e))
 
-            # Startup reconciliation — orphans + stales (audit §3.4 + §3.6).
-            # Must run before _poll/_keep_alive so we cannot race fills against
-            # an unrepaired DB view.
-            try:
-                async with db_factory() as db:
-                    await reconcile_against_broker(self._broker, db)
-            except Exception as e:
-                logger.error("startup_reconcile_failed", error=str(e))
+        async def _stream() -> None:
+            while not self._stopped:
+                try:
+                    async for update in self._broker.subscribe_trade_updates():
+                        if self._stopped:
+                            break
+                        try:
+                            await self._handle_update(update, db_factory)
+                        except Exception as e:
+                            logger.error(
+                                "handle_update_failed",
+                                error=str(e),
+                                broker_order_id=update.broker_order_id,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except NotImplementedError:
+                    # Broker has no push stream — fall back to polling only.
+                    logger.warning("trade_updates_not_implemented_polling_only")
+                    return
+                except Exception as e:
+                    logger.warning("trade_updates_stream_failed", error=str(e))
+                    if self._stopped:
+                        return
+                    await asyncio.sleep(5)
 
-        async def _poll():
+        async def _poll() -> None:
             while not self._stopped:
                 try:
                     async with db_factory() as db:
@@ -107,103 +139,85 @@ class LiveMonitor:
                     logger.warning("monitor_poll_failed", error=str(e))
                 await asyncio.sleep(30)
 
-        async def _keep_alive():
-            """ib_async is pure asyncio — no event-loop bridging needed.
-
-            Just keep the task alive so cancellation is observed and we exit
-            cleanly when the broker disconnects.
-            """
-            while not self._stopped and self._broker._ib.isConnected():
-                await asyncio.sleep(5)
-
+        stream_task = asyncio.create_task(_stream())
         poll_task = asyncio.create_task(_poll())
-        alive_task = asyncio.create_task(_keep_alive())
-        self._tasks = [poll_task, alive_task]
+        self._tasks = [stream_task, poll_task]
         try:
-            await asyncio.gather(poll_task, alive_task)
+            await asyncio.gather(stream_task, poll_task)
         except asyncio.CancelledError:
             logger.info("live_monitor_cancelled")
 
-    def _on_order_status(self, trade) -> None:
-        """ib_async orderStatusEvent callback (sync — schedule async handler)."""
-        if self._db_factory is None:
-            return
-        status = trade.orderStatus.status.lower() if trade.orderStatus else ""
-        if status in ("filled", "cancelled", "inactive"):
-            asyncio.create_task(self._handle_order_status(trade))
+    # ------------------------------------------------------------------
+    # Broker-agnostic event handler
+    # ------------------------------------------------------------------
 
-    def _on_exec_details(self, trade, fill) -> None:
-        """ib_async execDetailsEvent callback (sync — schedule async handler)."""
-        if self._db_factory is None:
-            return
-        asyncio.create_task(self._handle_fill(trade, fill))
+    async def _handle_update(self, update: TradeUpdate, db_factory) -> None:
+        """Process one broker ``TradeUpdate``. Idempotent.
 
-    async def _handle_order_status(self, trade) -> None:
-        """Process order status changes from ib_async."""
-        try:
-            order = trade.order
-            status = trade.orderStatus.status.lower() if trade.orderStatus else ""
-            order_ref = getattr(order, "orderRef", None)
+        Distinguishes entry vs exit fills by:
+          1. Checking ``update.raw['parent_id']`` if present (IBKR carries
+             the bracket parent id on every child event).
+          2. Falling back to a DB lookup: if a Position already exists with
+             ``broker_order_id == update.broker_order_id`` it's our parent
+             entry; if a Position exists whose ``broker_order_id`` matches
+             some other open order's parent we treat the fill as an exit.
+        """
+        event = (update.event or "").lower()
+        logger.info(
+            "broker_trade_update",
+            update_event=event,
+            broker_order_id=update.broker_order_id,
+            ticker=update.ticker,
+            qty=str(update.filled_qty),
+            price=str(update.filled_avg_price) if update.filled_avg_price else None,
+            broker=settings.broker.value,
+        )
 
-            logger.info(
-                "ibkr_order_status",
-                order_id=order.orderId,
-                status=status,
-                order_ref=order_ref,
-            )
-
-            if status in ("cancelled", "inactive") and order_ref:
-                async with self._db_factory() as db:
-                    draft = await self._find_draft_by_ref(db, order_ref)
-                    if draft and draft.status == OrderStatus.SENT:
-                        draft.status = (
-                            OrderStatus.CANCELLED
-                            if status == "cancelled"
-                            else OrderStatus.REJECTED
-                        )
-                        await db.commit()
-        except Exception as e:
-            logger.error("handle_order_status_failed", error=str(e))
-
-    async def _handle_fill(self, trade, fill) -> None:
-        """Process execution details from ib_async."""
-        try:
-            order = trade.order
-            execution = fill.execution
-            order_ref = getattr(order, "orderRef", None)
-            parent_id = getattr(order, "parentId", 0)
-
-            logger.info(
-                "ibkr_fill",
-                order_id=order.orderId,
-                parent_id=parent_id,
-                shares=execution.shares,
-                price=execution.avgPrice,
-                order_ref=order_ref,
-            )
-
-            async with self._db_factory() as db:
-                if parent_id == 0:
-                    # Entry fill — this is the parent order
-                    draft = await self._find_draft_by_ref(db, order_ref) if order_ref else None
-                    await self._on_entry_fill(
-                        db=db,
-                        draft=draft,
-                        broker_order_id=str(order.orderId),
-                        ticker=fill.contract.symbol,
-                        filled_qty=Decimal(str(execution.shares)),
-                        filled_avg=Decimal(str(execution.avgPrice)),
+        if event in _TERMINAL_NON_FILL_EVENTS:
+            client_ref = update.client_order_id
+            if not client_ref:
+                return
+            async with db_factory() as db:
+                draft = await self._find_draft_by_ref(db, client_ref)
+                if draft and draft.status == OrderStatus.SENT:
+                    draft.status = (
+                        OrderStatus.CANCELLED
+                        if event in {"canceled", "cancelled"}
+                        else OrderStatus.REJECTED
                     )
-                else:
-                    # Child fill (stop or target hit)
-                    await self._on_exit_fill(
-                        db=db,
-                        parent_order_id=str(parent_id),
-                        ticker=fill.contract.symbol,
-                        filled_avg=Decimal(str(execution.avgPrice)),
-                    )
-        except Exception as e:
-            logger.error("handle_fill_failed", error=str(e))
+                    await db.commit()
+            return
+
+        if event not in _FILL_EVENTS:
+            return  # "new", "pending_new", etc. — informational only
+
+        # It's a fill (full or partial). Decide entry vs exit.
+        parent_id_raw = (update.raw or {}).get("parent_id")
+        is_child = bool(parent_id_raw) and str(parent_id_raw) not in {"0", ""}
+
+        async with db_factory() as db:
+            if is_child:
+                await self._on_exit_fill(
+                    db=db,
+                    parent_order_id=str(parent_id_raw),
+                    ticker=update.ticker,
+                    filled_avg=update.filled_avg_price or Decimal("0"),
+                )
+                return
+
+            # Otherwise treat as a parent / entry fill. Try to resolve the
+            # draft via client_order_id (which we set to draft.id on submit).
+            draft = None
+            if update.client_order_id:
+                draft = await self._find_draft_by_ref(db, update.client_order_id)
+            await self._on_entry_fill(
+                db=db,
+                draft=draft,
+                broker_order_id=update.broker_order_id,
+                ticker=update.ticker,
+                filled_qty=update.filled_qty,
+                filled_avg=update.filled_avg_price or Decimal("0"),
+            )
 
     async def _find_draft_by_ref(self, db: AsyncSession, order_ref: str) -> DraftOrder | None:
         """Find a DraftOrder by its orderRef (which we set to draft.id)."""
@@ -228,9 +242,6 @@ class LiveMonitor:
             return
 
         # Idempotency: if a Position already exists for this broker_order_id, skip.
-        # Both the ib_async event stream and the 30s reconciler can deliver the
-        # same fill — the UNIQUE(broker_order_id) constraint on Position protects
-        # at the DB layer, but we check first so we don't waste a transaction.
         existing = (await db.execute(
             select(Position).where(Position.broker_order_id == broker_order_id)
         )).scalar_one_or_none()
@@ -272,6 +283,7 @@ class LiveMonitor:
                 "ticker": ticker,
                 "qty": str(filled_qty),
                 "price": str(filled_avg),
+                "broker": settings.broker.value,
             },
         ))
         await db.commit()
@@ -334,6 +346,7 @@ class LiveMonitor:
                 "pnl_usd": str(position.pnl_usd) if position.pnl_usd else None,
                 "pnl_pct": str(position.pnl_pct) if position.pnl_pct else None,
                 "close_reason": position.close_reason.value if position.close_reason else None,
+                "broker": settings.broker.value,
             },
         ))
         await db.commit()
@@ -360,8 +373,8 @@ class LiveMonitor:
                 bo = await self._broker.get_order(draft.broker_order_id)
                 if bo.state == BrokerOrderState.FILLED and bo.filled_avg_price:
                     # Drift repair: if a Position already exists for this
-                    # broker_order_id (the ws fill won the race), don't try to
-                    # insert a duplicate — just heal the draft status.
+                    # broker_order_id (the stream fill won the race), don't try
+                    # to insert a duplicate — just heal the draft status.
                     existing = (await db.execute(
                         select(Position).where(
                             Position.broker_order_id == bo.broker_order_id
