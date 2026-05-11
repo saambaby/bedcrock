@@ -1,6 +1,6 @@
 # Bedcrock v2 — Multi-Agent Implementation Plan
 
-How to ship the 14 commits in [`bedcrock-plan-v2.md §V2.12`](../bedcrock-plan-v2.md) using parallel Claude Code subagents in git worktrees, with explicit dependency ordering, per-agent briefs, and a merge protocol.
+How to ship the 14 commits in [`bedcrock-plan.md §V2.12`](../bedcrock-plan.md) using parallel Claude Code subagents in git worktrees, with explicit dependency ordering, per-agent briefs, and a merge protocol.
 
 **Total estimated wall time:** ~1 day with parallel execution (vs. ~3 days sequential).
 **Total estimated agent-time:** ~8–10 agent-hours.
@@ -10,13 +10,13 @@ How to ship the 14 commits in [`bedcrock-plan-v2.md §V2.12`](../bedcrock-plan-v
 
 ## 1. Goal & success criteria
 
-**Goal:** all 14 commits from `bedcrock-plan-v2.md §V2.12` land on `main` in the order specified, with tests passing, and v0.1 paper-trading workflow continues to function (no regressions).
+**Goal:** all 14 commits from `bedcrock-plan.md §V2.12` land on `main` in the order specified, with tests passing, and v0.1 paper-trading workflow continues to function (no regressions).
 
 **Done means:**
 - [ ] `pytest tests/` passes (with the new tests added by Wave C)
 - [ ] `python -m src.workers.healthcheck` runs cleanly against a paper-mode IBKR connection
 - [ ] One end-to-end paper trade flows: signal ingested → scored → drafted → confirmed via `/confirm` → bracket placed at IBKR with stop `tif=GTC` (verifiable via TWS Order window)
-- [ ] All Phase 1 → Phase 2 acceptance checklist items from `bedcrock-plan-v2.md §V2.10` are testable (some require multi-day soak; this plan only requires the *test infra* to be in place)
+- [ ] All Phase 1 → Phase 2 acceptance checklist items from `bedcrock-plan.md §V2.10` are testable (some require multi-day soak; this plan only requires the *test infra* to be in place)
 - [ ] `docs/ENV.md`, `docs/DEPLOYMENT.md`, `bedcrock/AUDIT.md` updated to reflect v2
 
 ---
@@ -82,7 +82,7 @@ Wave A (Foundation, 1 sequential agent)
    - `movement_volume_spike_threshold: float = 3.0` (used by Wave B heavy-movement agent)
    - `movement_gap_threshold: float = 0.05`
    - `movement_check_interval_seconds: int = 300`
-   - `@model_validator(mode="after") _validate_mode_port` per `bedcrock-plan-v2.md §V2.9`
+   - `@model_validator(mode="after") _validate_mode_port` per `bedcrock-plan.md §V2.9`
 
 7. **Smoke test:** run `python -c "from src.broker.ibkr import IBKRBroker; from src.scoring.scorer import Scorer; from src.config import settings; print('imports OK')"` — confirms the migration didn't break import resolution.
 
@@ -108,15 +108,15 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/broker-safety` off `v2-staging`.
 
-**Owns commits:** 2, 3, 5 (partial), 6 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commits:** 2, 3, 5 (partial), 6 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
-1. `src/broker/ibkr.py::submit_bracket` — set `tif="GTC"` and `outsideRth=True` on the take-profit and stop-loss children. Parent stays `tif="DAY"`. Code reference: `bedcrock-plan-v2.md §V2.2`.
-2. `src/broker/ibkr.py::connect` — add `readonly: bool = False` parameter, exponential-backoff retry (5 attempts: 1s, 2s, 4s, 8s, 16s), terminal alert via `post_system_health` on failure. Code reference: `bedcrock-plan-v2.md §V2.4` (audit §3.6 + §3.8).
+1. `src/broker/ibkr.py::submit_bracket` — set `tif="GTC"` and `outsideRth=True` on the take-profit and stop-loss children. Parent stays `tif="DAY"`. Code reference: `bedcrock-plan.md §V2.2`.
+2. `src/broker/ibkr.py::connect` — add `readonly: bool = False` parameter, exponential-backoff retry (5 attempts: 1s, 2s, 4s, 8s, 16s), terminal alert via `post_system_health` on failure. Code reference: `bedcrock-plan.md §V2.4` (audit §3.6 + §3.8).
 3. **New file** `src/safety/__init__.py` (empty `__init__`).
 4. **New file** `src/safety/reconciler.py` containing:
-   - `audit_open_order_tifs(broker)` — re-issues any non-GTC bracket child. Code reference: `bedcrock-plan-v2.md §V2.2`.
-   - `reconcile_against_broker(broker, db)` — startup orphan/stale detection. Code reference: `bedcrock-plan-v2.md §V2.4`.
+   - `audit_open_order_tifs(broker)` — re-issues any non-GTC bracket child. Code reference: `bedcrock-plan.md §V2.2`.
+   - `reconcile_against_broker(broker, db)` — startup orphan/stale detection. Code reference: `bedcrock-plan.md §V2.4`.
 5. `src/orders/monitor.py::LiveMonitor.start()` — call `await reconcile_against_broker(self._broker, db)` after `await self._broker.connect()`, before `_poll` and `_keep_alive` start.
 6. `src/workers/monitor_worker.py` — add a 30s task that calls `audit_open_order_tifs(broker)` alongside the existing `_reconcile_orders` poll.
 
@@ -137,10 +137,10 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/monitor-idempotency` off `v2-staging`.
 
-**Owns commit:** 4 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commit:** 4 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
-1. `src/orders/monitor.py::_on_entry_fill` — add idempotency check at top: `SELECT Position WHERE broker_order_id = ?` returns non-None ⇒ log skip, ensure draft status = FILLED, return. Code reference: `bedcrock-plan-v2.md §V2.3`.
+1. `src/orders/monitor.py::_on_entry_fill` — add idempotency check at top: `SELECT Position WHERE broker_order_id = ?` returns non-None ⇒ log skip, ensure draft status = FILLED, return. Code reference: `bedcrock-plan.md §V2.3`.
 2. `src/orders/monitor.py::_reconcile_orders` — add `already_filled` check: if `Position.broker_order_id` matches an existing row, mark draft FILLED and skip. Code reference: same section.
 
 **Note:** the `UNIQUE` constraint on `Position.broker_order_id` already landed in Wave A's alembic migration; this agent does not touch the schema.
@@ -160,7 +160,7 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/daily-kill-switch` off `v2-staging`.
 
-**Owns commit:** 7 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commit:** 7 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
 1. `src/workers/monitor_worker.py` — add async task `update_daily_pnl(db)` running every 60s during market hours:
@@ -171,7 +171,7 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 2. `src/scoring/gates.py::_gate_daily_kill_switch` — replace stub with real implementation:
    - Read `DailyState` for today + mode.
    - If `daily_pnl_pct <= -settings.risk_daily_loss_pct`, return `blocked=True, overrideable=False`.
-   - Code reference: `bedcrock-plan-v2.md §V2.5` (audit §3.5).
+   - Code reference: `bedcrock-plan.md §V2.5` (audit §3.5).
 3. `src/workers/eod_worker.py` (existing) — ensure it writes the start-of-day `EquitySnapshot` *before* `update_daily_pnl` would run. If this isn't already the case, add it.
 
 **Tests in branch (`tests/test_gates.py` additions + new `tests/test_daily_pnl.py`):**
@@ -190,11 +190,11 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/sizing-and-sector` off `v2-staging`.
 
-**Owns commits:** 8, 9 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commits:** 8, 9 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
-1. `src/orders/builder.py::OrderBuilder.build_draft` — after `qty_by_risk` is computed, compute `qty_by_concentration = (account.equity * settings.risk_max_position_size_pct) / entry`, take `quantity = min(qty_by_risk, qty_by_concentration)`. Log when concentration cap binds. Code reference: `bedcrock-plan-v2.md §V2.7`.
-2. `src/scoring/gates.py::GateEvaluator._gate_correlation` — replace the stub at `gates.py:52` with the real implementation. Code reference: `bedcrock-plan-v2.md §V2.6`.
+1. `src/orders/builder.py::OrderBuilder.build_draft` — after `qty_by_risk` is computed, compute `qty_by_concentration = (account.equity * settings.risk_max_position_size_pct) / entry`, take `quantity = min(qty_by_risk, qty_by_concentration)`. Log when concentration cap binds. Code reference: `bedcrock-plan.md §V2.7`.
+2. `src/scoring/gates.py::GateEvaluator._gate_correlation` — replace the stub at `gates.py:52` with the real implementation. Code reference: `bedcrock-plan.md §V2.6`.
 3. `src/scoring/gates.py` — add `SECTOR_ETF_MAP` constant (top of file) covering at least Defense (ITA), Biotech (XBI), Tech (XLK), Discretionary (XLY), Energy (XLE), Financials (XLF). Add `OTHER` fallback.
 4. Wire `_gate_correlation` into `GateEvaluator.evaluate` — replace the stub `GateResult(gate=GateName.CORRELATION, blocked=False)` with the real call.
 
@@ -215,11 +215,11 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/heavy-movement` off `v2-staging`.
 
-**Owns commit:** 10 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commit:** 10 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
-1. **New file** `src/ingestors/heavy_movement.py` — `HeavyMovementIngestor` per `bedcrock-plan-v2.md §V2.5`. Inherits `IngestorBase`, `name="heavy_movement"`, `interval_seconds=settings.movement_check_interval_seconds`.
-2. `src/scoring/scorer.py::Scorer.score` — add `MARKET_MOVEMENT` handling at the top: if `signal.source == MARKET_MOVEMENT`, score is 0 unless a non-MARKET_MOVEMENT signal exists on the same ticker in last 14d, in which case score with `flow_corroboration_market` slot. Code reference: `bedcrock-plan-v2.md §V2.5`.
+1. **New file** `src/ingestors/heavy_movement.py` — `HeavyMovementIngestor` per `bedcrock-plan.md §V2.5`. Inherits `IngestorBase`, `name="heavy_movement"`, `interval_seconds=settings.movement_check_interval_seconds`.
+2. `src/scoring/scorer.py::Scorer.score` — add `MARKET_MOVEMENT` handling at the top: if `signal.source == MARKET_MOVEMENT`, score is 0 unless a non-MARKET_MOVEMENT signal exists on the same ticker in last 14d, in which case score with `flow_corroboration_market` slot. Code reference: `bedcrock-plan.md §V2.5`.
 3. `src/scoring/scorer.py::Scorer._score_cluster` — exclude MARKET_MOVEMENT from cluster source-counting; add 0.5-point bonus if a same-direction MARKET_MOVEMENT signal exists in last 14d.
 4. `src/schemas/__init__.py::ScoreBreakdown` — add `flow_corroboration_market: float = 0.0` field.
 5. `src/workers/ingest_worker.py` — register `HeavyMovementIngestor` in `IngestorRegistry`.
@@ -244,11 +244,11 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/backtester` off `v2-staging`.
 
-**Owns commit:** 11 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commit:** 11 from `bedcrock-plan.md §V2.12`.
 
 **Scope:**
 1. **New file** `src/backtest/__init__.py` (empty `__init__`).
-2. **New file** `src/backtest/replay.py` containing `ReplayReport` dataclass + `replay()` function + helpers (`_simulate_trade`, `_sharpe`, `_profit_factor`, `_score_signal`). Code reference: `bedcrock-plan-v2.md §V2.8`.
+2. **New file** `src/backtest/replay.py` containing `ReplayReport` dataclass + `replay()` function + helpers (`_simulate_trade`, `_sharpe`, `_profit_factor`, `_score_signal`). Code reference: `bedcrock-plan.md §V2.8`.
 3. `src/workers/eod_worker.py` — add a task that runs at Sunday 17:00 ET (1 hour before Cowork's weekly synthesis):
    - Read `99 Meta/scoring-rules-proposed.md` (use existing vault reader if available, else simple file read + YAML parse).
    - For each proposed weight set, call `replay(db, proposed_weights)`.
@@ -273,7 +273,7 @@ The orchestrator merges them back into `v2-staging` in arbitrary order as they c
 
 **Branch:** `v2/B/cleanup` off `v2-staging`.
 
-**Owns commit:** 12 from `bedcrock-plan-v2.md §V2.12`.
+**Owns commit:** 12 from `bedcrock-plan.md §V2.12`.
 
 **Scope:** delete the duplicates already documented in `bedcrock/AUDIT.md` §"Resume-session reconciliation":
 1. Delete `src/schemas/signal.py` (the standalone dataclass `ScoreBreakdown` — Pydantic version in `__init__.py` wins).
@@ -305,7 +305,7 @@ Send a single message with seven `Agent` tool calls (one per B agent above), all
 Each prompt should:
 - State the agent's number (B1–B7)
 - Quote the exact "Scope" and "Tests in branch" sections from this plan
-- Reference `bedcrock-plan-v2.md §V2.X` for code patterns
+- Reference `bedcrock-plan.md §V2.X` for code patterns
 - End with: "Commit on branch `v2/B/<feature>`. Do not merge. Report back with the commit hash and `pytest <new-test-files> -v` output."
 
 ---
@@ -347,12 +347,12 @@ Each prompt should:
 2. **`docs/DEPLOYMENT.md`** — add IBC + Xvfb + nightly logout section (per audit §3.6). Document the `gnzsnz/ib-gateway-docker` recommended path.
 3. **`docs/AUDIT.md`** — append a "v2 status" section noting which audit findings landed and which are deferred to v0.3.
 4. **`README.md`** — update the project layout block to show new `src/safety/`, `src/backtest/`, `src/ingestors/heavy_movement.py`. Update the design invariants list to include the 3 new v2 invariants.
-5. **`bedcrock-plan-v2.md`** — flip `status: draft` to `status: active`. Add a "Implementation completed: YYYY-MM-DD" line in the frontmatter.
+5. **`bedcrock-plan.md`** — flip `status: draft` to `status: active`. Add a "Implementation completed: YYYY-MM-DD" line in the frontmatter.
 6. **Final integration check:**
    - Run `pytest tests/ -v` one last time on the merged `v2-staging`.
    - Run `python -c "from src import broker, scoring, orders, ingestors, safety, backtest, db, api, workers, discord_bot; print('all packages import')"`.
    - If alembic env supports it, run `alembic upgrade head` against a throwaway test database.
-7. **Open the PR** from `v2-staging` to `main` with a description listing all 14 commits and pointing to `bedcrock-plan-v2.md` for the spec.
+7. **Open the PR** from `v2-staging` to `main` with a description listing all 14 commits and pointing to `bedcrock-plan.md` for the spec.
 
 **Acceptance:**
 - All 5 doc files updated.
@@ -433,7 +433,7 @@ You are agent <ID> implementing bedcrock v2 commit <#>.
 
 Context:
 - Project: /Users/sambaby/Development/@saam.baby/arp/bedcrock
-- Plan: bedcrock-plan-v2.md (v2 spec) — read sections <X.Y> for code patterns
+- Plan: bedcrock-plan.md (v2 spec) — read sections <X.Y> for code patterns
 - Implementation plan: docs/V2_IMPLEMENTATION_PLAN.md — your scope is §4 Agent <ID>
 - Branch: create v2/B/<feature> off v2-staging
 
@@ -450,7 +450,7 @@ Constraints:
 - If you need to add a config setting, it should already exist in src/config.py (added by Wave A); if it doesn't, fail fast and report rather than adding it yourself.
 
 Deliverable:
-- Commit titled per the table in bedcrock-plan-v2.md §V2.12
+- Commit titled per the table in bedcrock-plan.md §V2.12
 - pytest output for the new test files
 - Report under 200 words
 ```
@@ -508,7 +508,7 @@ Final orchestrator checklist before merging `v2-staging` → `main`:
 - [ ] `python -m src.workers.healthcheck` clean against a paper IBKR
 - [ ] One real paper trade confirmed end-to-end with `tif=GTC` on the bracket children (verified in TWS)
 - [ ] `bedcrock/AUDIT.md` v2-status section appended
-- [ ] `bedcrock-plan-v2.md` frontmatter flipped to `status: active`
+- [ ] `bedcrock-plan.md` frontmatter flipped to `status: active`
 - [ ] `bedcrock-plan.md` (v1) frontmatter updated to `status: superseded` with a pointer to v2
 - [ ] PR opened with the 14-commit summary
 
@@ -516,4 +516,4 @@ When ticked, merge to `main` and tag `v0.2.0`.
 
 ---
 
-*Implementation plan for `bedcrock-plan-v2.md`. Read that file first; this is the build choreography, not the spec.*
+*Implementation plan for `bedcrock-plan.md`. Read that file first; this is the build choreography, not the spec.*

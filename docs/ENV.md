@@ -117,7 +117,7 @@ and the gate stack reads it at runtime when implemented (v0.2).
 
 ## v2 additions
 
-These variables were introduced in v2 (see `bedcrock-plan-v2.md`).
+These variables were introduced in v2 (see `bedcrock-plan.md`).
 
 ### Risk — half-Kelly cap and sector concentration (N2, N3)
 

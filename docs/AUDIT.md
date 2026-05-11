@@ -316,6 +316,6 @@ The 2026-05-10 audit (`docs/AUDIT_2026-05-10.md`) surfaced 6 blockers (F1–F6) 
 | N4 — Mini-backtester for scoring-rule evaluation | §3.N4 | Landed | `7c2955c` |
 | Cleanup — duplicate scorers / `DraftOrderPayload` shims | §3.cleanup | Already done pre-v2 | — |
 
-The v2 spec (`bedcrock-plan-v2.md`) is now `status: active`; v1 (`bedcrock-plan.md`) is `status: superseded`. v2 also adds three new safety invariants (broker-truth-wins, GTC-by-construction, mode↔port coupled) — see `bedcrock-plan-v2.md` Changelog.
+The canonical spec at `bedcrock-plan.md` is now `status: active, version: v2` and reflects v0.2.0 reality. v2 also added three new safety invariants (broker-truth-wins, GTC-by-construction, mode↔port coupled) — see `bedcrock-plan.md` §2 and Appendix C (Version history).
 
 **Test status at merge candidate:** 118 of 123 tests pass. The 5 failing tests are all in `tests/test_vault.py` and predate v2 (they exercise a real `VaultWriter` that's not present on this branch tree — tracked as a v0.1 issue, not in v2 scope).
