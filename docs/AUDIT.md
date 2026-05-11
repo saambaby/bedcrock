@@ -1,6 +1,6 @@
 # Audit log
 
-Per-component review of v0.1. The plan in `the Bedcrock system plan` is the
+Per-component review of v0.1. The plan in `bedcrock-plan.md` is the
 spec; this doc records how the implementation aligns and where it diverges.
 Each section answers: **what's solid, what's a known gap, what's deferred to v0.2+**.
 
@@ -19,7 +19,7 @@ Reviewed: 2026-05-03
 
 **Gap**
 
-- No `region` setting on Settings — the broker factory currently picks Alpaca for both paper and live regardless of location. Canadian users with `MODE=live` will get an Alpaca live attempt that may or may not work depending on residency. **Mitigation**: documented in `docs/BROKER_SETUP.md` to keep `MODE=paper` until IBKR adapter ships.
+- (Resolved) Broker factory now uses IBKR for both paper and live. Paper vs live is controlled by IBKR_PORT.
 
 **Deferred**
 
@@ -89,7 +89,7 @@ Reviewed: 2026-05-03
 
 **Gap**
 
-- `daily_kill_switch` reads `daily_pnl_pct` from a context value that nobody currently populates. The live monitor would need to compute and stash it; v0.1 leaves it at 0, so the gate effectively never trips. **Mitigation**: relies on broker-side risk limits; user should set Alpaca account-level risk limits in their dashboard as a backstop.
+- `daily_kill_switch` reads `daily_pnl_pct` from a context value that nobody currently populates. The live monitor would need to compute and stash it; v0.1 leaves it at 0, so the gate effectively never trips. **Mitigation**: relies on broker-side risk limits; user should set IBKR account-level risk limits as a backstop.
 - `event_proximity` (FOMC/CPI) and `correlation` gates are listed in the enum but have no concrete classes. They're stubs.
 
 **Deferred**
@@ -107,17 +107,15 @@ Reviewed: 2026-05-03
 - `BrokerAdapter` ABC has the minimum surface: `get_account`, `submit_bracket`, `cancel_order`, `get_order`, `get_last_price`, `aclose`.
 - `client_order_id` is set to the `DraftOrder.id` UUID — broker rejects duplicate submissions, so confirm-twice is safe.
 - Bracket orders are server-side OCO. If the VPS dies, exits still fire.
-- Alpaca paper and live use the same code path with `paper=True`/`False` flag.
+- IBKR adapter is fully implemented. Paper and live use the same code path — only the port differs.
 
 **Gap**
-
-- IBKR adapter is a bare stub. Live trading for Canadian residents is blocked until it ships. This is the single largest gap to live deployment.
 - Position-level partial fills are tracked at the broker level but the Position row records full quantity at the entry fill — partial follow-up fills aren't summed. **Impact**: rare in practice for liquid names; observable in the audit log if it happens.
 
 **Deferred**
 
 - Multi-broker portfolio aggregation
-- Fractional share support (Alpaca supports it; we round to whole shares)
+- Fractional share support (IBKR supports it for some symbols; we round to whole shares)
 - Order modification (we only `cancel + resubmit`)
 
 ---
@@ -128,13 +126,13 @@ Reviewed: 2026-05-03
 
 - `OrderBuilder` validates: stop on correct side of entry, ATR-floor (auto-widens stops < 1.5×ATR), R:R ≥ 1.5, position size > 0.
 - Risk-based sizing: `qty = (equity × risk_pct/100) / |entry - stop|`.
-- `LiveMonitor` listens to Alpaca's `TradingStream` for instant fill notifications + 30s polling fallback for missed events.
+- `LiveMonitor` subscribes to IBKR's `orderStatusEvent` + `execDetailsEvent` for instant fill notifications + 30s polling fallback for missed events.
 - Closures fire a Discord alert AND drop a closure event in `00 Inbox/` for the hourly Cowork run.
 
 **Gap**
 
 - The polling fallback (`_reconcile_orders`) only catches FILLED state. If a draft is REJECTED while the WS is offline, the DB row stays in SENT until the next websocket reconnect.
-- `_handle_trade_update` parses Alpaca event payloads with both attribute access and dict access — works against current SDK but is defensive in a brittle way. If alpaca-py changes its event shape this needs adjusting.
+- Fill events rely on `orderRef` matching the draft UUID. If the ref is lost (e.g. IB Gateway restart mid-order), the polling fallback catches it via `broker_order_id`.
 - `setup_at_entry` is set on the Position row from the DraftOrder, but the order builder never gets the setup string from anywhere — the human or Cowork would need to set it on the draft at confirm time. **Currently null** in v0.1.
 
 **Deferred**
@@ -243,11 +241,9 @@ These are all on the v0.1.1 backlog. The risk of shipping without them is mitiga
 
 ## Open questions to revisit before live
 
-1. **Region-aware broker selection** — add a `BROKER` env var (`alpaca` | `ibkr`) explicit to user, document the choice.
-2. **IBKR adapter** — implement against `ib_async`, run paper-on-IBKR alongside paper-on-Alpaca for 30 days, compare drift.
-3. **Daily kill-switch wiring** — make sure `daily_pnl_pct` actually populates from the live monitor.
-4. **Scoring rule loader** — read weights from `99 Meta/scoring-rules.md` YAML at runtime so tweaks ship without redeploy.
-5. **Tests** — at minimum, scorer + gates + order builder before flipping `MODE=live`.
+1. **Daily kill-switch wiring** — make sure `daily_pnl_pct` actually populates from the live monitor.
+2. **Scoring rule loader** — read weights from `99 Meta/scoring-rules.md` YAML at runtime so tweaks ship without redeploy.
+3. **Tests** — at minimum, scorer + gates + order builder before flipping `MODE=live`.
 
 ---
 
@@ -263,7 +259,7 @@ v0.1 is **paper-ready**. It can:
 - accept human confirm/skip via Discord or signed deep link
 - write to a structured Obsidian vault for Cowork to reason over
 
-It is **not live-ready** for Canadian residents until the IBKR adapter ships. US residents with appropriate Alpaca onboarding could flip `MODE=live` after the plan §9 graduation criteria are met, but no tests exist yet — that should be the next milestone.
+It is **paper-ready on IBKR**. To go live, meet the plan §9 graduation criteria (Sharpe > 1.0, 50+ closed trades, 90 days), then switch `IBKR_PORT` to 4001 and `MODE=live`.
 
 ---
 
@@ -286,7 +282,7 @@ This pass merged two parallel build threads into one consistent codebase:
 
 - All 41 `src/*.py` files parse cleanly (`ast.parse` no errors).
 - Cross-module import resolution: every `from src.X import Y` resolves to a real export.
-- Modules that fail to import in the build sandbox (`src.db.session`, `src.broker.alpaca`, `src.discord_bot.webhooks`, etc.) all fail because `asyncpg`/`alpaca`/`httpx`/`discord` aren't pip-installed — the deps are correctly listed in `pyproject.toml` and will resolve on the VPS after `pip install -e .`.
+- Modules that fail to import in the build sandbox (`src.db.session`, `src.broker.ibkr`, `src.discord_bot.webhooks`, etc.) all fail because `asyncpg`/`ib_insync`/`httpx`/`discord` aren't pip-installed — the deps are correctly listed in `pyproject.toml` and will resolve on the VPS after `pip install .`.
 
 **Files NOT touched in this pass (existing build was already correct):**
 
@@ -299,3 +295,27 @@ This pass merged two parallel build threads into one consistent codebase:
 3. `DraftOrderPayload` is defined twice: in `src/schemas/__init__.py` (Pydantic, comprehensive) and in `src/schemas/order.py` (Pydantic, simpler). The init version wins; `order.py` is unused.
 
 These do not affect correctness — they're cruft from the merge. Cleanup is a v0.1.1 chore, not a blocker.
+
+---
+
+## v2 status (2026-05-10)
+
+The 2026-05-10 audit (`docs/AUDIT_2026-05-10.md`) surfaced 6 blockers (F1–F6) and a parallel research pass identified 4 components worth porting from a competing "Proxy Bot" design (N1–N4). All 10 items, plus the duplicate-scorer cleanup, landed on `v2-staging` over four parallel waves (A/B/C/D).
+
+| Item | Audit ref | Status | Landing commit |
+|---|---|---|---|
+| F1 — `ib_insync` → `ib_async` migration | §3.1 | Landed | `90ec1ad` |
+| F2 — `tif="GTC"` + `outsideRth=True` on stop/take-profit children | §3.2 | Landed | `de5eaa0` |
+| F3 — Idempotency check on `_on_entry_fill` + `UNIQUE(Position.broker_order_id)` | §3.3 | Landed | `f324062` |
+| F4 — `_reconcile_against_broker` on `LiveMonitor.start()` | §3.4 | Landed | in B1 reconciler commit (`de5eaa0`) |
+| F5 — `daily_pnl_pct` wired end-to-end → `daily_kill_switch` actually trips | §3.5 | Landed | `071a82d` |
+| F6 — Connection retry with backoff + IBC + nightly-logout docs | §3.6 | Landed | B1 (`de5eaa0`) + Wave D docs |
+| N1 — Heavy-movement ingestor (volume + 52w-high + gap) | §3.N1 | Landed | `3a2b658` |
+| N2 — Concrete sector-correlation gate | §3.N2 | Landed | `2fd9354` |
+| N3 — Half-Kelly per-position size cap (5%) | §3.N3 | Landed | B4 (`2fd9354`) |
+| N4 — Mini-backtester for scoring-rule evaluation | §3.N4 | Landed | `7c2955c` |
+| Cleanup — duplicate scorers / `DraftOrderPayload` shims | §3.cleanup | Already done pre-v2 | — |
+
+The v2 spec (`bedcrock-plan-v2.md`) is now `status: active`; v1 (`bedcrock-plan.md`) is `status: superseded`. v2 also adds three new safety invariants (broker-truth-wins, GTC-by-construction, mode↔port coupled) — see `bedcrock-plan-v2.md` Changelog.
+
+**Test status at merge candidate:** 118 of 123 tests pass. The 5 failing tests are all in `tests/test_vault.py` and predate v2 (they exercise a real `VaultWriter` that's not present on this branch tree — tracked as a v0.1 issue, not in v2 scope).

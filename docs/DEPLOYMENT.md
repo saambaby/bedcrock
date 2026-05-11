@@ -80,7 +80,7 @@ cp .env.example .env
 # Edit .env — every key documented inline. Required:
 #   DATABASE_URL  (must use postgresql+asyncpg://)
 #   VAULT_PATH    (absolute path; we'll create it next)
-#   ALPACA_API_KEY / ALPACA_API_SECRET
+#   IBKR_ACCOUNT (your IBKR paper/live account ID)
 #   QUIVER_API_KEY  UNUSUAL_WHALES_API_KEY  FINNHUB_API_KEY
 #   SEC_USER_AGENT (your name + email — required by SEC)
 #   DISCORD_WEBHOOK_*  DISCORD_BOT_TOKEN  DISCORD_GUILD_ID
