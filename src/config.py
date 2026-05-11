@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8080
     api_signing_secret: SecretStr = SecretStr("change-me")
+    # Bearer token for /dashboard/* and /scoring-proposals endpoints consumed
+    # by Claude Code skills. If empty, falls back to api_signing_secret so
+    # local-dev setups don't need a second secret.
+    api_bearer_token: SecretStr = SecretStr("")
 
     # --- Schedule ---
     ingest_interval_fast_min: int = 15
