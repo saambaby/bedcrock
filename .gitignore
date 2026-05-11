@@ -32,6 +32,3 @@ postgres_data/
 .coverage
 htmlcov/
 .mypy_cache/
-
-# Vault (synced separately)
-vault/
