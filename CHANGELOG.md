@@ -4,6 +4,39 @@ All notable changes to bedcrock. Format: [Keep a Changelog](https://keepachangel
 
 ---
 
+## [0.4.0] — 2026-05-11
+
+**Theme:** add Alpaca as a second broker behind a generic `BrokerAdapter`; keep IBKR as the only live path.
+
+Paper trading no longer requires IB Gateway/TWS. Set `BROKER=alpaca` plus two API keys and the full ingest → score → confirm → bracket → fill → close loop runs against Alpaca paper. Live trading remains IBKR-only (Alpaca brokerage is US-only and the user is in Canada — `BROKER=alpaca MODE=live` refuses to boot). The change is a contract refactor: every consumer (monitor, reconciler, scorer, workers) talks to `BrokerAdapter`, never a concrete broker class.
+
+### Added
+- Alpaca paper broker (`src/broker/alpaca.py`) over raw `httpx` + `websockets`. Equities only, paper base URL pinned to `paper-api.alpaca.markets`.
+- `Broker` enum (`IBKR`, `ALPACA`) on `Settings`; new vars `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_BASE_URL`, `ALPACA_DATA_URL`, `ALPACA_STREAM_URL`.
+- `BrokerAdapter` contract extended with `iter_open_orders()`, `iter_positions()`, `repair_child_to_gtc()`, and `subscribe_trade_updates()`. New dataclasses `OpenOrder`, `BrokerPosition`, `TradeUpdate` in `src/broker/base.py`.
+- WebSocket trade-updates stream — `subscribe_trade_updates()` yields normalized `TradeUpdate` events with auto-reconnect and exponential backoff. IBKR side bridges `ib_async`'s `execDetailsEvent` + `orderStatusEvent` into the same generator shape.
+- VCR cassette tests for `AlpacaBroker` under `tests/broker/` plus a re-record protocol in `tests/broker/cassettes/README.md`.
+- Truth-table tests for `_validate_broker_mode()` covering all four `(BROKER, MODE)` cells.
+
+### Changed
+- `make_broker()` in `src/broker/__init__.py` dispatches on `settings.broker` and returns either `IBKRBroker` or `AlpacaBroker`.
+- `src/safety/reconciler.py` and `src/orders/monitor.py` no longer import `IBKRBroker` concretely; they type their broker field as `BrokerAdapter` and reach `_ib` zero times. `audit_open_order_tifs` works on both adapters.
+- `src/orders/monitor.py` main loop became `async for update in broker.subscribe_trade_updates(): ...`, replacing the IBKR-specific event callback. The 30s polling fallback now uses `broker.iter_open_orders()` and remains broker-agnostic.
+- Audit-log rows include the broker tag (`settings.broker.value`) alongside the existing `MODE` tag so paper and live data on different brokers can be told apart.
+- Discord embeds carry an `[alpaca-paper]` / `[ibkr-paper]` / `[ibkr-live]` prefix in the title so channel context is obvious without splitting channels.
+- `Settings._validate_mode_port()` → `_validate_broker_mode()`; dispatches per broker per `docs/V4_ALPACA_PLAN.md` §3.
+- `BROKER=alpaca MODE=live` refuses to boot with: `Alpaca live brokerage is US-only; use BROKER=ibkr for live in Canada.`
+
+### Migration notes
+- `BROKER` defaults to `ibkr`. **Existing v0.3 deployments need no env-var changes** — they keep running on IBKR as before.
+- To switch to Alpaca paper: set `BROKER=alpaca` and provide `ALPACA_API_KEY` + `ALPACA_API_SECRET`. `IBKR_*` vars are ignored.
+- No DB migration required; existing `audit_log` schema already had a free-form `event` field where the broker tag now lives.
+- Run `python -m src.workers.healthcheck` after switching to confirm credentials and connectivity.
+
+**Tagged commits:** Wave A (foundation), Wave B (Alpaca adapter + tests), Wave C (consumer refactor + WS plumbing), Wave D (docs) — see merge history on `v4-staging`.
+
+---
+
 ## [0.3.0] — 2026-05-11
 
 **Theme:** drop the vault layer; migrate reasoning to Claude Code Routines.
