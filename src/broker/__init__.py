@@ -1,7 +1,8 @@
 """Broker package — adapter factory.
 
-Uses IBKR for both paper and live trading. Paper vs live is controlled by
-the IBKR_PORT setting (4002 = paper, 4001 = live) and the MODE env var.
+Dispatches on ``settings.broker``:
+  - ``BROKER=ibkr`` (default) — IBKR paper or live via IB Gateway / TWS.
+  - ``BROKER=alpaca`` — Alpaca paper only (live is US-only, refused at boot).
 """
 
 from src.broker.base import (
@@ -11,9 +12,13 @@ from src.broker.base import (
     BrokerError,
     BrokerOrder,
     BrokerOrderState,
+    BrokerPosition,
+    OpenOrder,
     OrderRejectedError,
+    TradeUpdate,
 )
 from src.broker.ibkr import IBKRBroker
+from src.config import Broker, settings
 
 # Compatibility aliases — older code uses these names
 BaseBroker = BrokerAdapter
@@ -22,7 +27,13 @@ SubmittedBracket = BrokerOrder
 
 
 def make_broker() -> BrokerAdapter:
-    """Return the IBKR broker adapter."""
+    """Return the broker adapter selected by ``settings.broker``."""
+    if settings.broker is Broker.ALPACA:
+        # Local import so the package still loads when alpaca deps / module
+        # are absent (Wave B adds ``src.broker.alpaca``).
+        from src.broker.alpaca import AlpacaBroker  # type: ignore[import-not-found]
+
+        return AlpacaBroker()
     return IBKRBroker()
 
 
@@ -34,13 +45,17 @@ __all__ = [
     "AccountState",
     "BaseBroker",
     "BracketOrderRequest",
+    "Broker",
     "BrokerAdapter",
     "BrokerError",
     "BrokerOrder",
     "BrokerOrderState",
+    "BrokerPosition",
     "IBKRBroker",
+    "OpenOrder",
     "OrderRejectedError",
     "SubmittedBracket",
+    "TradeUpdate",
     "get_broker",
     "make_broker",
 ]

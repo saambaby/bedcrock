@@ -24,6 +24,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -35,6 +36,8 @@ from src.broker.base import (
     BrokerError,
     BrokerOrder,
     BrokerOrderState,
+    BrokerPosition,
+    OpenOrder,
     OrderRejectedError,
 )
 from src.config import settings
@@ -321,6 +324,108 @@ class IBKRBroker(BrokerAdapter):
             submitted_at=datetime.now(UTC),
             raw={"perm_id": trade.order.permId},
         )
+
+    # ----- v4 BrokerAdapter contract extensions -----
+
+    _ORDER_TYPE_MAP = {
+        "LMT": "limit",
+        "STP": "stop",
+        "STP LMT": "stop_limit",
+        "TRAIL": "trailing_stop",
+        "MKT": "market",
+    }
+
+    async def iter_open_orders(self) -> AsyncIterator[OpenOrder]:
+        """Walk ``ib.openTrades()`` and yield each as an ``OpenOrder``."""
+        ib = await self._ensure()
+        for trade in ib.openTrades():
+            order = trade.order
+            contract = trade.contract
+            parent_id = getattr(order, "parentId", 0) or 0
+            order_type_raw = (order.orderType or "").upper()
+            order_type = self._ORDER_TYPE_MAP.get(order_type_raw, order_type_raw.lower())
+            side = Action.BUY if (order.action or "").upper() == "BUY" else Action.SELL
+            limit_price = (
+                Decimal(str(order.lmtPrice))
+                if getattr(order, "lmtPrice", None) not in (None, 0, 0.0)
+                else None
+            )
+            stop_price = (
+                Decimal(str(order.auxPrice))
+                if getattr(order, "auxPrice", None) not in (None, 0, 0.0)
+                else None
+            )
+            yield OpenOrder(
+                broker_order_id=str(order.orderId),
+                parent_order_id=str(parent_id) if parent_id else None,
+                ticker=getattr(contract, "symbol", "") or "",
+                side=side,
+                order_type=order_type,
+                quantity=Decimal(str(order.totalQuantity)),
+                limit_price=limit_price,
+                stop_price=stop_price,
+                tif=(order.tif or "").lower(),
+                raw={
+                    "order_id": order.orderId,
+                    "perm_id": getattr(order, "permId", None),
+                    "parent_id": parent_id,
+                    "order_type": order_type_raw,
+                },
+            )
+
+    async def iter_positions(self) -> AsyncIterator[BrokerPosition]:
+        """Walk ``ib.positions()`` and yield each as a ``BrokerPosition``."""
+        ib = await self._ensure()
+        for pos in ib.positions():
+            if pos.position == 0:
+                continue
+            contract = pos.contract
+            yield BrokerPosition(
+                ticker=getattr(contract, "symbol", "") or "",
+                quantity=Decimal(str(pos.position)),
+                avg_entry_price=Decimal(str(pos.avgCost)),
+                market_value=None,
+                unrealized_pnl=None,
+                raw={
+                    "account": getattr(pos, "account", None),
+                    "con_id": getattr(contract, "conId", None),
+                },
+            )
+
+    async def repair_child_to_gtc(self, broker_order_id: str) -> str:
+        """Cancel a non-GTC child and re-submit with ``tif='GTC'``.
+
+        Extracted from ``src.safety.reconciler.audit_open_order_tifs`` so the
+        repair is callable per-order via the abstract contract. Returns the new
+        broker_order_id (string).
+        """
+        ib = await self._ensure()
+        target_trade: Trade | None = None
+        for trade in ib.openTrades():
+            if str(trade.order.orderId) == str(broker_order_id):
+                target_trade = trade
+                break
+        if target_trade is None:
+            raise BrokerError(f"Order {broker_order_id} not found among open trades")
+
+        order = target_trade.order
+        original_tif = order.tif
+        ib.cancelOrder(order)
+        order.tif = "GTC"
+        order.outsideRth = True
+        order.orderId = 0  # force IBKR to assign a new ID
+        new_trade = ib.placeOrder(target_trade.contract, order)
+        logger.info(
+            "ibkr_repair_child_to_gtc",
+            old_order_id=broker_order_id,
+            new_order_id=new_trade.order.orderId,
+            original_tif=original_tif,
+        )
+        return str(new_trade.order.orderId)
+
+    def subscribe_trade_updates(self) -> AsyncIterator:  # noqa: D401
+        """Wave C/C2 wires this. See ``BrokerAdapter.subscribe_trade_updates``."""
+        raise NotImplementedError("subclass must implement subscribe_trade_updates")
 
     async def aclose(self) -> None:
         await self.disconnect()
