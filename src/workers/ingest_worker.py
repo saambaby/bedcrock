@@ -43,7 +43,6 @@ from src.logging_config import configure_logging, get_logger
 from src.orders.builder import BracketBuilder
 from src.schemas import RawSignal, ScoredSignal
 from src.scoring import GateEvaluator, Scorer
-from src.vault.writer import VaultWriter
 
 logger = get_logger(__name__)
 
@@ -66,7 +65,6 @@ class IngestOrchestrator:
         self.scorer = Scorer()
         self.gates = GateEvaluator()
         self.builder = BracketBuilder()
-        self.vault = VaultWriter()
 
     async def run_once(self) -> None:
         logger.info("orchestrator_tick_start")
@@ -132,15 +130,6 @@ class IngestOrchestrator:
         sig.gates_failed = scored.gates_failed
         sig.status = SignalStatus.BLOCKED if scored.gate_blocked else SignalStatus.PROCESSED
         await db.commit()
-
-        try:
-            md_path = await self.vault.write_signal(
-                sig, score_breakdown=breakdown.model_dump()
-            )
-            sig.vault_path = str(md_path)
-            await db.commit()
-        except Exception as e:
-            logger.error("vault_signal_write_failed", error=str(e))
 
         try:
             await post_firehose(
