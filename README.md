@@ -99,6 +99,10 @@ These come from the plan and are enforced in code:
 
 `docs/AUDIT.md` records the per-component review notes from the initial build. Every PR that touches a component appends to it.
 
+## Version history
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the v0.1 → v0.2 → v0.3 evolution. The current major shape (Postgres + Claude Code Routines + Discord, no vault) landed in v0.3.0.
+
 ## License
 
 Personal use only. This is not a commercial product. Don't sell signals from it.
