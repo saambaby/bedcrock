@@ -1,7 +1,7 @@
 """Interactive Brokers adapter — paper and live trading.
 
-Uses `ib_insync` to connect to IB Gateway or TWS. Paper vs live is just a
-different port:
+Uses `ib_async` (the maintained successor to `ib_insync`) to connect to IB
+Gateway or TWS. Paper vs live is just a different port:
   - TWS paper: 7497  |  TWS live: 7496
   - Gateway paper: 4002  |  Gateway live: 4001
 
@@ -17,7 +17,7 @@ Setup:
   4. For paper trading, log in with "Paper Trading" mode
 
 References:
-  - https://ib-insync.readthedocs.io
+  - https://ib-api.readthedocs.io  (ib_async docs)
   - https://interactivebrokers.github.io/tws-api/
 """
 
@@ -27,7 +27,7 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ib_insync import IB, Stock, Trade
+from ib_async import IB, Stock, Trade
 
 from src.broker.base import (
     AccountSnapshot,
@@ -73,34 +73,69 @@ class IBKRBroker(BrokerAdapter):
     def is_paper(self) -> bool:
         return settings.is_paper
 
-    async def connect(self) -> None:
+    async def connect(self, readonly: bool = False) -> None:
         if self._connected and self._ib.isConnected():
             return
         host = settings.ibkr_host
         port = settings.ibkr_port
         client_id = settings.ibkr_client_id
 
+        # Exponential-backoff retry: 5 attempts at 1s, 2s, 4s, 8s, 16s
+        delays = [1, 2, 4, 8, 16]
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate(delays, start=1):
+            try:
+                await self._ib.connectAsync(
+                    host=host,
+                    port=port,
+                    clientId=client_id,
+                    readonly=readonly,
+                    account=settings.ibkr_account or "",
+                )
+                self._connected = True
+                logger.info(
+                    "ibkr_connected",
+                    host=host,
+                    port=port,
+                    client_id=client_id,
+                    paper=self.is_paper,
+                    readonly=readonly,
+                    attempt=attempt,
+                )
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "ibkr_connect_attempt_failed",
+                    host=host,
+                    port=port,
+                    attempt=attempt,
+                    delay=delay,
+                    error=str(e),
+                )
+                if attempt < len(delays):
+                    await asyncio.sleep(delay)
+
+        # Terminal alert via Discord system-health webhook
         try:
-            await self._ib.connectAsync(
-                host=host,
-                port=port,
-                clientId=client_id,
-                readonly=False,
-                account=settings.ibkr_account or "",
+            from src.discord_bot.webhooks import post_system_health
+
+            await post_system_health(
+                title="IBKR connection failed",
+                body=(
+                    f"Could not connect to IB Gateway at {host}:{port} after "
+                    f"{len(delays)} attempts. Last error: {last_exc}"
+                ),
+                ok=False,
             )
-            self._connected = True
-            logger.info(
-                "ibkr_connected",
-                host=host,
-                port=port,
-                client_id=client_id,
-                paper=self.is_paper,
-            )
-        except Exception as e:
-            raise BrokerError(
-                f"Failed to connect to IB Gateway at {host}:{port} — "
-                f"is IB Gateway/TWS running? Error: {e}"
-            ) from e
+        except Exception as alert_exc:
+            logger.error("ibkr_connect_alert_failed", error=str(alert_exc))
+
+        raise BrokerError(
+            f"Failed to connect to IB Gateway at {host}:{port} after "
+            f"{len(delays)} attempts — is IB Gateway/TWS running? "
+            f"Last error: {last_exc}"
+        ) from last_exc
 
     async def disconnect(self) -> None:
         if self._ib.isConnected():
@@ -116,8 +151,8 @@ class IBKRBroker(BrokerAdapter):
         try:
             if not self._ib.isConnected():
                 return False
-            # Quick check — request managed accounts
-            await asyncio.to_thread(self._ib.managedAccounts)
+            # Quick check — request managed accounts (sync call, returns cached list)
+            self._ib.managedAccounts()
             return True
         except Exception:
             return False
@@ -126,8 +161,8 @@ class IBKRBroker(BrokerAdapter):
         ib = await self._ensure()
         account = settings.ibkr_account or ""
 
-        # ib_insync accountSummary is synchronous under the hood
-        summary = await asyncio.to_thread(ib.accountSummary, account)
+        # ib_async provides a native async variant
+        summary = await ib.accountSummaryAsync(account)
 
         values: dict[str, str] = {}
         for item in summary:
@@ -162,7 +197,7 @@ class IBKRBroker(BrokerAdapter):
 
         contract = Stock(ticker, "SMART", "USD")
         try:
-            qualified = await asyncio.to_thread(ib.qualifyContracts, contract)
+            qualified = await ib.qualifyContractsAsync(contract)
             if not qualified:
                 raise OrderRejectedError(f"Could not qualify contract for {ticker}")
         except OrderRejectedError:
@@ -180,15 +215,30 @@ class IBKRBroker(BrokerAdapter):
             stopLossPrice=stop_price,
         )
 
+        # bracket = [parent, take_profit, stop_loss]
+        parent, take_profit, stop_loss = bracket
+
+        # Parent: DAY (entry zone is a same-day decision per plan v1 §6.2)
+        parent.tif = "DAY"
+        parent.outsideRth = False
+
+        # Children MUST be GTC + outsideRth — otherwise stop expires at session
+        # close and overnight gap risk has no protection (audit §3.2).
+        for child in (take_profit, stop_loss):
+            child.tif = "GTC"
+            child.outsideRth = True
+
         # Set client_order_id on parent for idempotency
         client_order_id = getattr(spec, "client_order_id", None)
         if client_order_id:
-            bracket[0].orderRef = client_order_id
+            parent.orderRef = client_order_id
 
         trades: list[Trade] = []
         try:
             for order in bracket:
-                trade = await asyncio.to_thread(ib.placeOrder, contract, order)
+                # ib_async placeOrder is non-blocking — returns Trade immediately,
+                # async work happens via the event loop.
+                trade = ib.placeOrder(contract, order)
                 trades.append(trade)
         except Exception as e:
             logger.error("ibkr_submit_failed", error=str(e), ticker=ticker)
@@ -216,7 +266,7 @@ class IBKRBroker(BrokerAdapter):
         # Find the order in open orders
         for trade in ib.openTrades():
             if str(trade.order.orderId) == broker_order_id:
-                await asyncio.to_thread(ib.cancelOrder, trade.order)
+                ib.cancelOrder(trade.order)
                 return
         logger.warning("ibkr_cancel_order_not_found", order_id=broker_order_id)
 
@@ -227,7 +277,7 @@ class IBKRBroker(BrokerAdapter):
             if str(trade.order.orderId) == broker_order_id:
                 return self._trade_to_broker_order(trade)
         # Check completed trades
-        fills = await asyncio.to_thread(ib.fills)
+        fills = await ib.reqExecutionsAsync()
         for fill in fills:
             if str(fill.execution.orderId) == broker_order_id:
                 return BrokerOrder(
@@ -244,8 +294,8 @@ class IBKRBroker(BrokerAdapter):
         try:
             ib = await self._ensure()
             contract = Stock(ticker.upper(), "SMART", "USD")
-            await asyncio.to_thread(ib.qualifyContracts, contract)
-            [ticker_data] = await asyncio.to_thread(ib.reqTickers, contract)
+            await ib.qualifyContractsAsync(contract)
+            [ticker_data] = await ib.reqTickersAsync(contract)
             # Use midpoint if available, otherwise last
             if ticker_data.midpoint() and ticker_data.midpoint() == ticker_data.midpoint():
                 return Decimal(str(ticker_data.midpoint()))

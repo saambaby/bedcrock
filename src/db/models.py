@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -60,6 +61,7 @@ class SignalSource(str, enum.Enum):
     UW_CONGRESS = "uw_congress"
     UW_DARKPOOL = "uw_darkpool"
     MANUAL = "manual"
+    MARKET_MOVEMENT = "market_movement"  # v2: heavy-movement ingestor (corroboration only)
 
 
 class SignalStatus(str, enum.Enum):
@@ -107,6 +109,7 @@ class CloseReason(str, enum.Enum):
     SIGNAL_EXIT = "signal_exit"
     DISCRETIONARY = "discretionary"
     EOD_CANCELLED = "eod_cancelled"
+    EXTERNAL = "external"  # v2: closed outside the bot (mobile app, manual broker action)
 
 
 # ---------- Tables ----------
@@ -274,7 +277,9 @@ class Position(Base):
     draft_order_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("draft_orders.id"), nullable=True
     )
-    broker_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    broker_order_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True, unique=True
+    )
 
     # Entry
     entry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -365,3 +370,22 @@ class AuditLog(Base):
     target_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class DailyState(Base):
+    """Per-(date, mode) intraday state.
+
+    Updated continuously by `monitor_worker.update_daily_pnl` so the daily
+    kill-switch gate has live data to read. (date, mode) is the composite PK.
+    Distinct from `EquitySnapshot`, which is the EOD-frozen historical record.
+    """
+
+    __tablename__ = "daily_state"
+
+    date: Mapped[datetime] = mapped_column(Date, primary_key=True)
+    mode: Mapped[Mode] = mapped_column(SAEnum(Mode, name="mode"), primary_key=True)
+    daily_pnl_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=Decimal("0"))
+    equity_at_open: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

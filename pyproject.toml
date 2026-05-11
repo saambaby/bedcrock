@@ -29,7 +29,7 @@ dependencies = [
     "pytz>=2024.1",
 
     # --- Broker (IBKR for both paper and live) ---
-    "ib-insync>=0.9.86",
+    "ib_async==2.1.0",
     "yfinance>=0.2.40",
 
     # --- Indicators ---

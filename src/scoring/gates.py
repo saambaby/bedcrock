@@ -9,13 +9,16 @@ won anyway?"
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.broker import get_broker
 from src.config import settings
 from src.db.models import (
+    DailyState,
     EarningsCalendar,
     GateName,
     Position,
@@ -28,6 +31,29 @@ from src.schemas import GateResult, IndicatorSnapshot, RawSignal
 logger = get_logger(__name__)
 
 STALE_DAYS = 14
+
+# Sector clustering map for the correlation gate. Bedcrock's universe is
+# structurally cluster-prone (defense, biotech, etc.), so we map tickers to
+# a representative sector ETF and cap aggregate exposure per sector. Tickers
+# not listed fall back to "OTHER" — extend as the watchlist evolves.
+SECTOR_ETF_MAP: dict[str, str] = {
+    # Defense
+    "LMT": "ITA", "RTX": "ITA", "NOC": "ITA", "GD": "ITA", "BA": "ITA",
+    "LHX": "ITA", "HII": "ITA", "TXT": "ITA",
+    # Biotech
+    "MRNA": "XBI", "BNTX": "XBI", "CRSP": "XBI", "VRTX": "XBI", "REGN": "XBI",
+    "BIIB": "XBI", "GILD": "XBI", "ALNY": "XBI",
+    # Mega-cap tech
+    "NVDA": "XLK", "AAPL": "XLK", "MSFT": "XLK", "GOOGL": "XLK", "GOOG": "XLK",
+    "META": "XLK", "AVGO": "XLK", "ORCL": "XLK", "CRM": "XLK", "AMD": "XLK",
+    # Consumer discretionary
+    "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY", "NKE": "XLY", "MCD": "XLY",
+    # Energy
+    "XOM": "XLE", "CVX": "XLE", "COP": "XLE", "SLB": "XLE", "EOG": "XLE",
+    # Financials
+    "JPM": "XLF", "BAC": "XLF", "GS": "XLF", "WFC": "XLF", "MS": "XLF",
+    "C": "XLF", "BLK": "XLF",
+}
 
 
 class GateEvaluator:
@@ -46,12 +72,11 @@ class GateEvaluator:
         results.append(await self._gate_stale_signal(signal))
         results.append(await self._gate_snoozed(db, signal))
         results.append(await self._gate_max_open_positions(db))
+        results.append(await self._gate_daily_kill_switch(db))
+        results.append(await self._gate_correlation(db, signal, indicators))
 
-        # Correlation, event-proximity, daily-kill require richer context;
-        # deferred to v0.2. For now they pass.
-        results.append(GateResult(gate=GateName.CORRELATION, blocked=False))
+        # Event-proximity remains a stub for v0.2.
         results.append(GateResult(gate=GateName.EVENT_PROXIMITY, blocked=False))
-        results.append(GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False))
 
         return results
 
@@ -124,6 +149,82 @@ class GateEvaluator:
             )
         return GateResult(gate=GateName.SNOOZED, blocked=False)
 
+    async def _gate_correlation(
+        self,
+        db: AsyncSession,
+        signal: RawSignal,
+        indicators: IndicatorSnapshot | None,
+    ) -> GateResult:
+        """Block when proposed trade would push a sector's exposure over the cap.
+
+        Fail-open when we lack the data needed to compute exposure (no
+        indicators, no last_price, or zero/unknown account equity) — the
+        liquidity gate already catches missing-indicator cases as blocking,
+        so failing open here is safe.
+        """
+        if indicators is None or indicators.price is None:
+            return GateResult(gate=GateName.CORRELATION, blocked=False)
+
+        proposed_sector = SECTOR_ETF_MAP.get(signal.ticker.upper(), "OTHER")
+
+        open_positions = (
+            await db.execute(
+                select(Position).where(
+                    Position.mode == settings.mode,
+                    Position.status == PositionStatus.OPEN,
+                )
+            )
+        ).scalars().all()
+
+        broker = get_broker()
+        try:
+            await broker.connect()
+            account = await broker.get_account()
+        except Exception as e:  # noqa: BLE001 — fail-open, log it
+            logger.warning("correlation_gate_account_fetch_failed", error=str(e))
+            try:
+                await broker.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            return GateResult(gate=GateName.CORRELATION, blocked=False)
+        finally:
+            try:
+                await broker.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if account.equity <= 0:
+            return GateResult(gate=GateName.CORRELATION, blocked=False)
+
+        sector_exposure: dict[str, Decimal] = {}
+        for pos in open_positions:
+            sec = SECTOR_ETF_MAP.get(pos.ticker.upper(), "OTHER")
+            sector_exposure[sec] = sector_exposure.get(sec, Decimal(0)) + (
+                pos.entry_price * pos.quantity
+            )
+
+        # Worst-case projection: assume the new position consumes the full
+        # half-Kelly cap (V2.7). This intentionally over-estimates so the gate
+        # binds *before* the order is sized, not after.
+        max_position_pct = Decimal(str(settings.risk_max_position_size_pct))
+        estimated_proposed = account.equity * max_position_pct
+        existing = sector_exposure.get(proposed_sector, Decimal(0))
+        projected = existing + estimated_proposed
+        projected_pct = float(projected / account.equity)
+
+        limit = float(settings.risk_sector_concentration_limit)
+        if projected_pct > limit:
+            return GateResult(
+                gate=GateName.CORRELATION,
+                blocked=True,
+                reason=(
+                    f"Sector {proposed_sector} would be {projected_pct * 100:.1f}% of equity "
+                    f"(limit {limit * 100:.0f}%). Existing: ${float(existing):,.0f}"
+                ),
+                overrideable=True,
+            )
+        return GateResult(gate=GateName.CORRELATION, blocked=False)
+
     async def _gate_max_open_positions(self, db: AsyncSession) -> GateResult:
         stmt = select(Position).where(
             Position.mode == settings.mode,
@@ -139,3 +240,31 @@ class GateEvaluator:
                 overrideable=False,
             )
         return GateResult(gate=GateName.MAX_OPEN_POSITIONS, blocked=False)
+
+    async def _gate_daily_kill_switch(self, db: AsyncSession) -> GateResult:
+        """Trip when today's intraday P&L breaches `risk_daily_loss_pct`.
+
+        Reads `DailyState` for `(date.today(), settings.mode)`. If no row exists
+        (e.g. before the pre-open snapshot lands), fail-open — we'd rather take
+        a trade than block the whole session on a stale state table.
+        """
+        stmt = select(DailyState).where(
+            DailyState.date == date.today(),
+            DailyState.mode == settings.mode,
+        )
+        row = (await db.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False)
+
+        threshold = Decimal(str(settings.risk_daily_loss_pct))
+        if row.daily_pnl_pct <= -threshold:
+            return GateResult(
+                gate=GateName.DAILY_KILL_SWITCH,
+                blocked=True,
+                reason=(
+                    f"Daily P&L {row.daily_pnl_pct:.2f}% breached "
+                    f"-{threshold:.2f}% kill switch"
+                ),
+                overrideable=False,
+            )
+        return GateResult(gate=GateName.DAILY_KILL_SWITCH, blocked=False)

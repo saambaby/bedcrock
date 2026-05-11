@@ -128,12 +128,30 @@ class OrderBuilder:
 
         risk_pct = Decimal(str(settings.risk_per_trade_pct))
         dollar_risk = account.equity * risk_pct / Decimal("100")
-        quantity = (dollar_risk / risk).quantize(Decimal("1"))
+        qty_by_risk = (dollar_risk / risk).quantize(Decimal("1"))
+
+        # Half-Kelly cap: never more than `risk_max_position_size_pct` of equity
+        # in one position, regardless of how tight the stop is.
+        max_position_pct = Decimal(str(settings.risk_max_position_size_pct))
+        qty_by_concentration = (
+            (account.equity * max_position_pct) / entry
+        ).quantize(Decimal("1"))
+
+        quantity = min(qty_by_risk, qty_by_concentration)
         await broker.disconnect()
 
         if quantity <= 0:
             logger.info("size_zero", ticker=ticker)
             return None
+
+        if quantity == qty_by_concentration and qty_by_concentration < qty_by_risk:
+            logger.info(
+                "position_size_capped_by_concentration",
+                ticker=ticker,
+                qty_by_risk=str(qty_by_risk),
+                qty_by_concentration=str(qty_by_concentration),
+                cap_pct=float(max_position_pct),
+            )
 
         # Persist
         draft = DraftOrder(

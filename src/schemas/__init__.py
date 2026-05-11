@@ -47,6 +47,7 @@ class ScoreBreakdown(BaseModel):
     size: float = 0.0
     insider_corroboration: float = 0.0
     options_flow_corroboration: float = 0.0
+    flow_corroboration_market: float = 0.0
     trader_track_record: float = 0.0
     public_statement: float = 0.0
     trend_alignment: float = 0.0

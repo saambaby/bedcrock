@@ -1,6 +1,6 @@
 """Live monitor — the always-on listener.
 
-Subscribes to IBKR's order/trade events via ib_insync and translates fills into:
+Subscribes to IBKR's order/trade events via ib_async and translates fills into:
   - Position rows (on entry fills)
   - Closure inbox events (on stop/target fills) — for Cowork's hourly run
   - Discord #position-alerts pings
@@ -36,13 +36,14 @@ from src.db.models import (
 )
 from src.discord_bot.webhooks import post_position_alert
 from src.logging_config import get_logger
+from src.safety.reconciler import reconcile_against_broker
 from src.vault.writer import write_closure_event, write_position
 
 logger = get_logger(__name__)
 
 
 class LiveMonitor:
-    """Monitors broker order fills via ib_insync events + polling fallback."""
+    """Monitors broker order fills via ib_async events + polling fallback."""
 
     def __init__(self) -> None:
         self._broker = make_broker()
@@ -82,12 +83,21 @@ class LiveMonitor:
             logger.error("live_monitor_connect_failed", error=str(e))
             return
 
-        # Subscribe to ib_insync events if using IBKR
+        # Subscribe to ib_async events if using IBKR
         if isinstance(self._broker, IBKRBroker):
             ib = self._broker._ib
             ib.orderStatusEvent += self._on_order_status
             ib.execDetailsEvent += self._on_exec_details
             logger.info("live_monitor_subscribed_to_ibkr_events")
+
+            # Startup reconciliation — orphans + stales (audit §3.4 + §3.6).
+            # Must run before _poll/_keep_alive so we cannot race fills against
+            # an unrepaired DB view.
+            try:
+                async with db_factory() as db:
+                    await reconcile_against_broker(self._broker, db)
+            except Exception as e:
+                logger.error("startup_reconcile_failed", error=str(e))
 
         async def _poll():
             while not self._stopped:
@@ -99,12 +109,13 @@ class LiveMonitor:
                 await asyncio.sleep(30)
 
         async def _keep_alive():
-            """Keep ib_insync event loop running."""
-            if isinstance(self._broker, IBKRBroker):
-                ib = self._broker._ib
-                while not self._stopped and ib.isConnected():
-                    ib.sleep(1)
-                    await asyncio.sleep(0.1)
+            """ib_async is pure asyncio — no event-loop bridging needed.
+
+            Just keep the task alive so cancellation is observed and we exit
+            cleanly when the broker disconnects.
+            """
+            while not self._stopped and self._broker._ib.isConnected():
+                await asyncio.sleep(5)
 
         poll_task = asyncio.create_task(_poll())
         alive_task = asyncio.create_task(_keep_alive())
@@ -115,7 +126,7 @@ class LiveMonitor:
             logger.info("live_monitor_cancelled")
 
     def _on_order_status(self, trade) -> None:
-        """ib_insync orderStatusEvent callback (sync — schedule async handler)."""
+        """ib_async orderStatusEvent callback (sync — schedule async handler)."""
         if self._db_factory is None:
             return
         status = trade.orderStatus.status.lower() if trade.orderStatus else ""
@@ -123,13 +134,13 @@ class LiveMonitor:
             asyncio.create_task(self._handle_order_status(trade))
 
     def _on_exec_details(self, trade, fill) -> None:
-        """ib_insync execDetailsEvent callback (sync — schedule async handler)."""
+        """ib_async execDetailsEvent callback (sync — schedule async handler)."""
         if self._db_factory is None:
             return
         asyncio.create_task(self._handle_fill(trade, fill))
 
     async def _handle_order_status(self, trade) -> None:
-        """Process order status changes from ib_insync."""
+        """Process order status changes from ib_async."""
         try:
             order = trade.order
             status = trade.orderStatus.status.lower() if trade.orderStatus else ""
@@ -156,7 +167,7 @@ class LiveMonitor:
             logger.error("handle_order_status_failed", error=str(e))
 
     async def _handle_fill(self, trade, fill) -> None:
-        """Process execution details from ib_insync."""
+        """Process execution details from ib_async."""
         try:
             order = trade.order
             execution = fill.execution
@@ -215,6 +226,24 @@ class LiveMonitor:
         """Handle an entry fill — create a Position row."""
         if draft is None:
             logger.warning("entry_fill_no_draft", ticker=ticker)
+            return
+
+        # Idempotency: if a Position already exists for this broker_order_id, skip.
+        # Both the ib_async event stream and the 30s reconciler can deliver the
+        # same fill — the UNIQUE(broker_order_id) constraint on Position protects
+        # at the DB layer, but we check first so we don't waste a transaction.
+        existing = (await db.execute(
+            select(Position).where(Position.broker_order_id == broker_order_id)
+        )).scalar_one_or_none()
+        if existing is not None:
+            logger.info(
+                "entry_fill_already_processed",
+                broker_order_id=broker_order_id,
+                ticker=ticker,
+            )
+            if draft.status != OrderStatus.FILLED:
+                draft.status = OrderStatus.FILLED
+                await db.commit()
             return
 
         position = Position(
@@ -344,6 +373,25 @@ class LiveMonitor:
             try:
                 bo = await self._broker.get_order(draft.broker_order_id)
                 if bo.state == BrokerOrderState.FILLED and bo.filled_avg_price:
+                    # Drift repair: if a Position already exists for this
+                    # broker_order_id (the ws fill won the race), don't try to
+                    # insert a duplicate — just heal the draft status.
+                    existing = (await db.execute(
+                        select(Position).where(
+                            Position.broker_order_id == bo.broker_order_id
+                        )
+                    )).scalar_one_or_none()
+                    if existing is not None:
+                        if draft.status != OrderStatus.FILLED:
+                            draft.status = OrderStatus.FILLED
+                            await db.commit()
+                            logger.info(
+                                "reconcile_repaired_draft_status",
+                                draft_id=str(draft.id),
+                                broker_order_id=bo.broker_order_id,
+                            )
+                        continue
+
                     await self._on_entry_fill(
                         db=db,
                         draft=draft,

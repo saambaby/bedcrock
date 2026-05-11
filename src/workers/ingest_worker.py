@@ -33,6 +33,7 @@ from src.indicators import IndicatorComputer
 from src.ingestors import (
     BaseIngestor,
     FinnhubEarningsIngestor,
+    HeavyMovementIngestor,
     QuiverCongressIngestor,
     SECForm4Ingestor,
     UWCongressIngestor,
@@ -54,6 +55,7 @@ def _build_ingestors() -> list[BaseIngestor]:
         UWFlowIngestor(),
         UWCongressIngestor(),
         FinnhubEarningsIngestor(),
+        HeavyMovementIngestor(),
     ]
 
 

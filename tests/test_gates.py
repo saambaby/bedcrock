@@ -7,12 +7,13 @@ Run: pytest tests/test_gates.py
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.db.models import Action, GateName, SignalSource
+from src.db.models import Action, DailyState, GateName, Mode, SignalSource
 from src.schemas import IndicatorSnapshot, RawSignal
 from src.scoring.gates import GateEvaluator
 
@@ -174,3 +175,159 @@ async def test_liquidity_below_threshold_not_overrideable(evaluator):
     )
     result = await evaluator._gate_liquidity(ind)
     assert result.overrideable is False
+
+
+# ---------------------------------------------------------------------------
+# Daily kill switch gate (B3, V2.5)
+# ---------------------------------------------------------------------------
+
+from src.broker.base import AccountSnapshot
+
+
+def _mock_db_with_daily_state(state: DailyState | None) -> MagicMock:
+    """Build an AsyncSession-like mock whose `execute(...).scalar_one_or_none()`
+    returns the supplied DailyState (or None)."""
+    db = MagicMock()
+    result = MagicMock()
+    result.scalar_one_or_none = MagicMock(return_value=state)
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_blocks_at_negative_threshold(evaluator):
+    """P&L of -2.5% is past the default 2% threshold — blocked, not overrideable."""
+    state = DailyState(
+        date=date.today(),
+        mode=Mode.PAPER,
+        daily_pnl_pct=Decimal("-2.5"),
+        equity_at_open=Decimal("100000"),
+    )
+    db = _mock_db_with_daily_state(state)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.gate == GateName.DAILY_KILL_SWITCH
+    assert result.blocked is True
+    assert result.overrideable is False
+    assert "kill switch" in (result.reason or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_passes_above_threshold(evaluator):
+    """P&L of -1% is within tolerance — passes."""
+    state = DailyState(
+        date=date.today(),
+        mode=Mode.PAPER,
+        daily_pnl_pct=Decimal("-1.0"),
+        equity_at_open=Decimal("100000"),
+    )
+    db = _mock_db_with_daily_state(state)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.blocked is False
+
+
+@pytest.mark.asyncio
+async def test_daily_kill_switch_passes_when_no_state(evaluator):
+    """No DailyState row (e.g. before pre-open snapshot) — fail-open, pass."""
+    db = _mock_db_with_daily_state(None)
+    result = await evaluator._gate_daily_kill_switch(db)
+    assert result.gate == GateName.DAILY_KILL_SWITCH
+    assert result.blocked is False
+
+
+# ---------------------------------------------------------------------------
+# Sector correlation gate (B4, V2.6)
+# ---------------------------------------------------------------------------
+
+
+def _mock_db_with_positions(positions):
+    db = MagicMock()
+    scalars = MagicMock()
+    scalars.all = MagicMock(return_value=positions)
+    result = MagicMock()
+    result.scalars = MagicMock(return_value=scalars)
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+def _mock_correlation_broker(equity: Decimal):
+    broker = MagicMock()
+    broker.connect = AsyncMock(return_value=None)
+    broker.disconnect = AsyncMock(return_value=None)
+    broker.get_account = AsyncMock(
+        return_value=AccountSnapshot(
+            equity=equity,
+            cash=equity,
+            positions_value=Decimal("0"),
+            buying_power=equity,
+            pattern_day_trader=False,
+        )
+    )
+    return broker
+
+
+def _make_position(ticker: str, entry_price: Decimal, quantity: Decimal):
+    p = MagicMock()
+    p.ticker = ticker
+    p.entry_price = entry_price
+    p.quantity = quantity
+    return p
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_blocks_overconcentration(evaluator, monkeypatch):
+    """3 ITA positions totaling 22% of 100k equity; new ITA proposal blocked.
+
+    Worst-case projection adds 5% (half-Kelly cap) -> 27% > 25% limit.
+    """
+    equity = Decimal("100000")
+    positions = [
+        _make_position("LMT", Decimal("400"), Decimal("20")),   # 8_000
+        _make_position("RTX", Decimal("100"), Decimal("80")),   # 8_000
+        _make_position("NOC", Decimal("500"), Decimal("12")),   # 6_000
+    ]
+    db = _mock_db_with_positions(positions)
+    broker = _mock_correlation_broker(equity)
+    monkeypatch.setattr("src.scoring.gates.get_broker", lambda: broker)
+
+    signal = _make_raw_signal(ticker="GD")  # Defense -> ITA
+    indicators = IndicatorSnapshot(
+        ticker="GD",
+        computed_at=datetime.now(UTC),
+        price=Decimal("250"),
+    )
+    result = await evaluator._gate_correlation(db, signal, indicators)
+    assert result.gate == GateName.CORRELATION
+    assert result.blocked is True
+    assert "ITA" in result.reason
+    assert result.overrideable is True
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_passes_when_under_limit(evaluator, monkeypatch):
+    """One ITA at 5% of equity; new ITA proposal would be 10% — under 25%."""
+    equity = Decimal("100000")
+    positions = [
+        _make_position("LMT", Decimal("500"), Decimal("10")),  # 5_000 = 5%
+    ]
+    db = _mock_db_with_positions(positions)
+    broker = _mock_correlation_broker(equity)
+    monkeypatch.setattr("src.scoring.gates.get_broker", lambda: broker)
+
+    signal = _make_raw_signal(ticker="RTX")
+    indicators = IndicatorSnapshot(
+        ticker="RTX",
+        computed_at=datetime.now(UTC),
+        price=Decimal("100"),
+    )
+    result = await evaluator._gate_correlation(db, signal, indicators)
+    assert result.blocked is False
+
+
+@pytest.mark.asyncio
+async def test_sector_gate_failopen_when_no_indicators(evaluator):
+    """No indicators -> fail-open (other gates handle missing data as block)."""
+    signal = _make_raw_signal(ticker="LMT")
+    db = MagicMock()  # never touched
+    result = await evaluator._gate_correlation(db, signal, None)
+    assert result.gate == GateName.CORRELATION
+    assert result.blocked is False
