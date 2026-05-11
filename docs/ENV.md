@@ -21,14 +21,6 @@ have no default and the app will refuse to start without them.
 
 ---
 
-## Vault
-
-| Variable | Default | Description |
-|---|---|---|
-| `VAULT_PATH` | — (required) | Absolute path to the `Trading/` folder of your Obsidian vault. |
-
----
-
 ## Broker — IBKR
 
 IB Gateway or TWS must be running. See `docs/BROKER_SETUP.md` for full setup.
@@ -91,8 +83,7 @@ See `docs/DISCORD_SETUP.md` for end-to-end setup.
 
 ## Risk limits
 
-These are gate defaults; the vault file `99 Meta/risk-limits.md` is human-editable
-and the gate stack reads it at runtime when implemented (v0.2).
+These are gate defaults read at startup from environment variables.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -142,6 +133,28 @@ The config validator now refuses to start when `MODE` and `IBKR_PORT` disagree:
 - `MODE=live` requires `IBKR_PORT ∈ {4001, 7496}`
 
 A mismatched pair raises a `ValueError` at import time — the bot will not run.
+
+---
+
+## Claude Code Routine variables
+
+These variables are **not** read from bedcrock's `.env`. They are configured in
+the Routine config at https://claude.ai/code/routines (per scheduled skill).
+The Claude Code skills under `.claude/skills/` use them to call bedcrock's
+FastAPI dashboard endpoints and post to Discord.
+
+| Variable | Description |
+|---|---|
+| `API_BASE_URL` | Bedcrock FastAPI base URL (e.g. `https://bedcrock.example.com`). Skills hit `${API_BASE_URL}/dashboard/*` and `${API_BASE_URL}/scoring-proposals`. |
+| `API_BEARER_TOKEN` | Bearer token for `/dashboard/*` and `/scoring-proposals`. Must match the server's `settings.api_bearer_token`, or fall back to `api_signing_secret` when bearer-token is unset. |
+| `DISCORD_WEBHOOK_HIGH_SCORE` | Webhook the morning/intraday skills post high-score gameplans to. |
+| `DISCORD_WEBHOOK_POSITIONS` | Webhook the hourly-closure skill posts position-state updates to. |
+| `DISCORD_WEBHOOK_SYSTEM_HEALTH` | Webhook the weekly-synthesis + skill heartbeat posts go to. |
+
+These mirror the same Discord webhook URLs that bedcrock itself uses
+(`DISCORD_WEBHOOK_*` in the Discord section above) — the skills post directly
+rather than via the bedcrock backend, so they need their own copies in the
+Routine config.
 
 ---
 
