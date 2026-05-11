@@ -6,9 +6,8 @@ All other modules import from here, never from os.environ directly.
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,9 +36,6 @@ class Settings(BaseSettings):
 
     # --- Database ---
     database_url: str = "postgresql+asyncpg://bedcrock:bedcrock@localhost:5432/bedcrock"
-
-    # --- Vault ---
-    vault_path: Path = Field(default=Path("/home/bedcrock/vault/Trading"))
 
     # --- Broker (IBKR) ---
     # Paper: port 4002 (Gateway) or 7497 (TWS)
@@ -96,13 +92,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: LogFormat = LogFormat.JSON
     sentry_dsn: str = ""
-
-    @field_validator("vault_path")
-    @classmethod
-    def _vault_path_absolute(cls, v: Path) -> Path:
-        if not v.is_absolute():
-            raise ValueError(f"VAULT_PATH must be absolute, got {v}")
-        return v
 
     @field_validator("database_url")
     @classmethod
