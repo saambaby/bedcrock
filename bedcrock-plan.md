@@ -1,13 +1,13 @@
 ---
 title: Bedcrock — Build & Migration Plan
 status: active
-version: v2
+version: v3
 phase: paper-1
 created: 2026-05-03
-updated: 2026-05-11
+updated: 2026-05-10
 implemented: 2026-05-10
-shipped_as: v0.2.0
-tags: [trading/system, plan, obsidian]
+shipped_as: v0.3.0
+tags: [trading/system, plan]
 ---
 
 # Bedcrock
@@ -18,7 +18,7 @@ A signal-aggregation and analysis system that watches politicians, hedge fund ti
 > This is a personal research/decision-support system. It is not a registered advisory service. Do not let other people's money ride on it without consulting a securities lawyer in your jurisdiction.
 
 > [!info] Document version
-> This is the canonical, self-contained spec. It folds in everything that landed in v0.2.0 (the six audit fixes F1–F6 and the four Proxy Bot ports N1–N4). For the evolution from the v0.1 spec, see Appendix C — Version history.
+> This is the canonical, self-contained spec. It folds in everything that landed in v0.3.0 (drop the Obsidian vault and Cowork prompts; reasoning moves to Claude Code skills + cloud-hosted Routines). For the full evolution from v0.1 → v0.2 → v0.3, see Appendix C — Version history.
 
 ---
 
@@ -26,7 +26,7 @@ A signal-aggregation and analysis system that watches politicians, hedge fund ti
 
 **Goals**
 - Surface high-signal trade ideas from delayed but reliable disclosures (STOCK Act, 13F, Form 4) and faster sources (options flow, public statements).
-- Use Claude (via Cowork) for the heavy reasoning layer four-plus times per day, with always-on infrastructure handling the parts Claude can't.
+- Use Claude (via cloud-hosted Claude Code Routines) for the heavy reasoning layer four-plus times per day, with always-on infrastructure handling the parts Claude can't.
 - Build paper-trading data with the **exact same schema** as live, so the live switch is a config flip, not a rewrite.
 - Generate a feedback loop (closure post-mortems, weekly synthesis) that improves the scoring rules over time.
 
@@ -41,10 +41,10 @@ A signal-aggregation and analysis system that watches politicians, hedge fund ti
 
 These are the invariants. Every component has to respect them or migration breaks.
 
-1. **Paper and live share one data path.** The only difference between paper and live is the broker endpoint and a `mode: paper|live` flag. Everything else — vault layout, Discord channels, Cowork prompts, scoring, schemas — is identical.
-2. **Cowork is the reasoning layer, not the infrastructure layer.** Anything that needs to run while your laptop is asleep lives on the always-on backend.
-3. **The vault is the source of truth.** Discord and the broker are views on top of vault state, not parallel systems.
-4. **Inbox-then-process.** The backend only writes to `00 Inbox/`. Cowork only writes to everywhere else. No write conflicts ever.
+1. **Paper and live share one data path.** The only difference between paper and live is the broker endpoint and a `mode: paper|live` flag. Everything else — DB schemas, Discord channels, Claude Code skills, scoring — is identical.
+2. **Three-layer authority.** The broker (IBKR) is the source of truth for live positions and open orders — it survives bot/VPS/network death. The DB (Postgres) is operational truth for everything else: signals, drafts, indicators, audit log, daily state, scoring proposals, replay reports. The Claude Code reasoning layer consumes the DB via a FastAPI read layer; it does not have its own persistence. On conflict between layers, broker beats DB beats reasoning.
+3. **DB is the only durable store.** Claude Code Routines (cloud-hosted, scheduled) read from FastAPI read endpoints, reason, and write back through dedicated POST endpoints (e.g. `/scoring-proposals`). There is no file-based IPC bus.
+4. **Reasoning is stateless and replayable.** Routines hold no state between runs; every run starts from a fresh dashboard fetch. Re-running a skill on the same DB snapshot produces the same conclusions modulo Claude's sampling.
 5. **Every decision leaves a trace.** Every entry, exit, and skipped signal gets a note. Without traces, the weekly synthesis has nothing to learn from.
 6. **Humans confirm entries; machines manage exits.** Bot prepares the bracket order with stop and target attached; you click once to send it. Once filled, server-side OCO at the broker manages the exit even if your VPS dies. This split is intentional: humans are good at sanity-checking but bad at obeying stops, machines are the opposite.
 7. **Broker truth wins on conflict.** On any startup or post-disconnect reconnect, IBKR's view of positions and open orders is the source of truth; the DB is repaired to match (with an audit-log entry per repair). Orphan positions in IBKR with no DB record raise an alert; DB rows the broker has no record of are marked closed-externally.
@@ -76,40 +76,50 @@ flowchart LR
         B6[Reconciler<br/>broker truth wins]
     end
 
-    subgraph Vault [Obsidian Vault]
-        V1[00 Inbox]
-        V2[01 Watchlist]
-        V3[02 Open Positions]
-        V4[03 Closed]
-        V5[04 Traders]
-        V6[05 Daily]
-        V7[99 Meta]
+    subgraph DB [Postgres]
+        D1[signals]
+        D2[positions]
+        D3[indicators]
+        D4[daily_state]
+        D5[audit_log]
+        D6[scoring_proposals]
+        D7[scoring_replay_reports]
     end
 
-    subgraph Cowork [Cowork Scheduled Tasks]
-        C1[Morning Heavy Run<br/>08:00 ET]
-        C2[Intraday Light Runs<br/>11:00, 14:00, 16:30]
-        C3[Hourly Closure Run]
-        C4[Weekly Synthesis<br/>Sun 18:00]
+    subgraph API [FastAPI dashboard endpoints]
+        E1[/dashboard/morning]
+        E2[/dashboard/intraday]
+        E3[/dashboard/closures]
+        E4[/dashboard/weekly]
+        E5[/dashboard/status]
+        E6[POST /scoring-proposals]
     end
 
-    Discord[Discord<br/>#signals-firehose<br/>#high-score<br/>#position-alerts]
+    subgraph Routines [Claude Code Routines — Anthropic infrastructure, cloud]
+        R1[morning-analyze<br/>06:30 ET weekdays]
+        R2[intraday-check<br/>12:00 + 14:00 ET]
+        R3[hourly-closure<br/>10:00–16:00 ET]
+        R4[weekly-synthesis<br/>Sun 19:00 ET]
+        R5[status<br/>on-demand]
+    end
+
+    Discord[Discord<br/>#signals-firehose<br/>#high-score<br/>#position-alerts<br/>#system-health]
     Human((You<br/>one-click confirm))
 
-    Sources --> B1 --> B2 --> V1
-    A6 --> B5 --> V2
+    Sources --> B1 --> B2 --> D1
+    A6 --> B5 --> D3
     A7 -- "corroboration only" --> B2
     B2 --> Discord
-    B3 --> V1
+    B3 --> D2
     B3 --> Discord
     B4 <--> B3
     B6 <--> B4
-    V1 --> Cowork
-    Cowork --> V2 & V3 & V4 & V6 & V7
-    Cowork --> Discord
-    Cowork -- "ACT TODAY list" --> Human
+    DB --> API --> Routines
+    Routines --> Discord
+    Routines -- "POST proposals" --> E6 --> D6
+    Routines -- "ACT TODAY list" --> Human
     Human -- "click confirm" --> B4
-    B4 -- "fill confirmation" --> V3
+    B4 -- "fill confirmation" --> D2
 ```
 
 ---
@@ -169,7 +179,7 @@ Four phases, each with explicit graduation criteria. Don't skip phases. Most of 
 - [ ] At least 60 calendar days in Live Phase 1
 - [ ] At least 25 closed live trades
 - [ ] Live Sharpe within 30% of Phase 2 paper Sharpe (otherwise the slippage model is wrong)
-- [ ] Max drawdown stayed within `99 Meta/risk-limits.md` Live Phase 1 limits
+- [ ] Max drawdown stayed within the configured Live Phase 1 limits (see §10)
 - [ ] No operational incidents requiring manual broker intervention
 - [ ] Paper kept running in parallel for the full 60 days (head-to-head data exists)
 
@@ -212,8 +222,7 @@ Pick the cheapest set that covers two faster channels and one slower channel for
 - `discord.py` + `discord-webhook` for posts and slash commands
 - **`ib_async==2.1.0`** for the IBKR adapter (paper and live, same code path) — pure-asyncio, actively maintained successor to the abandoned `ib_insync`
 - `pandas` + `pandas-ta` for indicator computation (Wilder ATR, RSI)
-- `syncthing` for vault file sync between VPS and your laptop
-- `git` cron job for daily vault backup to a private repo
+- `pg_dump` cron job for nightly Postgres backup to a private object store
 - **IBC** (https://github.com/IbcAlpha/IBC) + Xvfb in a `gnzsnz/ib-gateway-docker`-style container for IB Gateway lifecycle. IBKR forces a logout window 23:45–00:45 ET nightly and again Sunday for re-auth; IBC handles auto-relogin. Configure `AutoRestartTime=23:45` (time-based, not token-based — token AutoRestart is broken on unfunded paper accounts per IBC issue #345). The `LiveMonitor` tolerates a ~5-min disconnect without paging. `IBKRBroker.connect()` retries with exponential backoff (5 attempts: 1s, 2s, 4s, 8s, 16s) and posts a system-health alert on terminal failure.
 
 **Responsibilities:**
@@ -221,83 +230,56 @@ Pick the cheapest set that covers two faster channels and one slower channel for
 - Apply the scoring pipeline (see §8).
 - Apply hard gates (see §5.7) before a signal escalates to `#high-score` or `ACT TODAY`.
 - Compute and cache the indicator/pattern layer (see §5.8) for every ticker in the watchlist.
-- Write signal `.md` files into `00 Inbox/`.
+- Persist signals, indicators, drafts, positions, and audit rows into Postgres.
 - Post to Discord webhooks.
-- Run the live monitor (price subscriptions for tickers in `02 Open Positions/`).
+- Run the live monitor (price subscriptions for currently-open positions in the DB).
 - Prepare bracket orders for one-click confirmation (see §5.9).
 - Talk to IBKR for paper or live fills and position state, depending on `MODE` and `IBKR_PORT`.
 
-### 5.3 Vault Structure
+### 5.3 Reasoning Surface
 
-```
-Trading/
-├── 00 Inbox/                  # backend writes only
-├── 01 Watchlist/              # one note per active candidate
-├── 02 Open Positions/         # one note per held position (paper or live)
-├── 03 Closed/                 # post-mortems
-├── 04 Traders/                # one note per tracked person
-├── 05 Daily/                  # Cowork's run outputs
-├── 06 Weekly/                 # synthesis notes
-├── 99 Meta/
-│   ├── scoring-rules.md       # current weights (versioned)
-│   ├── watchlist-config.md    # tracked traders, sectors, thresholds
-│   ├── risk-limits.md         # position size, drawdown, kill switch
-│   └── changelog.md           # every rule change with rationale
-└── Templates/                 # frontmatter templates
-```
+The reasoning layer is a small set of Claude Code project skills under `.claude/skills/`. Each skill is a SKILL.md file (YAML frontmatter + prompt body) that fetches data from the FastAPI dashboard endpoints, reasons over it, and posts to Discord. There is no local file IPC; all state flows through Postgres.
 
-**Frontmatter schemas** — keep these stable across paper and live:
+| Skill | Path | Purpose |
+|---|---|---|
+| `morning-analyze` | `.claude/skills/morning-analyze/SKILL.md` | Build the day's gameplan from `/dashboard/morning`; post triage embed to `#high-score`. |
+| `intraday-check` | `.claude/skills/intraday-check/SKILL.md` | Light midday review of open positions and watchlist via `/dashboard/intraday`; alert on triggers. |
+| `hourly-closure` | `.claude/skills/hourly-closure/SKILL.md` | Process recent fills/closes from `/dashboard/closures`; post post-mortems to `#position-alerts`. |
+| `weekly-synthesis` | `.claude/skills/weekly-synthesis/SKILL.md` | Aggregate 7-day stats from `/dashboard/weekly`; if a weight change is supported, POST to `/scoring-proposals`. |
+| `status` | `.claude/skills/status/SKILL.md` | On-demand `/status`-style snapshot from `/dashboard/status`. |
 
-`00 Inbox/` signal file:
+**Skill frontmatter** (Claude Code 2026 spec):
+
 ```yaml
 ---
-type: signal
-status: new          # new | processed | ignored
-mode: paper          # paper | live
-ticker: NVDA
-trader: "[[Pelosi]]"
-source: capitol-trades
-action: buy
-disclosed_at: 2026-05-02
-trade_date_range: [2026-04-15, 2026-04-15]
-size_range_usd: [50000, 100000]
-score: 7.2
-score_breakdown:
-  cluster: 2.0
-  committee_match: 1.5
-  size: 1.7
-  sector_momentum: 2.0
-links:
-  source_url: https://capitoltrades.com/...
-urgent: false
+name: morning-analyze
+description: <when this skill applies; how it's invoked>
+disable-model-invocation: true   # only user- or Routine-invokable
+allowed-tools:
+  - Bash(curl *)
+  - Bash(jq *)
+context: same
 ---
 ```
 
-`02 Open Positions/` position file:
-```yaml
----
-type: position
-status: open         # open | closed
-mode: paper          # paper | live
-ticker: NVDA
-broker_order_id: ibkr_xxx
-entry_date: 2026-05-03
-entry_price: 942.15
-quantity: 5
-size_usd: 4710.75
-stop: 866.78
-target: 1130.00
-thesis_link: "[[01 Watchlist/NVDA]]"
-source_signals:
-  - "[[00 Inbox/2026-05-02-NVDA-pelosi]]"
-  - "[[00 Inbox/2026-04-28-NVDA-form4]]"
----
-```
+**Registration as Routines.** Each skill is registered as a cloud-hosted Routine via `/schedule` from a `claude` session at the bedcrock repo root (e.g. `/schedule "every weekday 06:30 ET, run /morning-analyze"`). Routines run on Anthropic infrastructure — no VPS daemon, no laptop required. Manage them at `claude.ai/code/routines`. The `status` skill is on-demand only; the other four have cron-style schedules listed in §5.5.
 
-`03 Closed/` post-mortem file: same as position, plus `exit_date`, `exit_price`, `pnl_usd`, `pnl_pct`, `holding_days`, `vs_spy_pct`, `vs_sector_pct`, `close_reason: stop_hit | target_hit | signal_exit | discretionary | external`.
+**FastAPI read endpoints consumed by the skills:**
+
+- `GET /dashboard/morning` — overnight signals not yet acted on, current open positions, today's earnings calendar, regime snapshot, gates that blocked entries yesterday.
+- `GET /dashboard/intraday` — open positions with current P&L vs. trailing-stop distance, active watchlist alerts.
+- `GET /dashboard/closures?hours=24` — recent fill events (entries and exits) for post-mortem generation.
+- `GET /dashboard/weekly` — 7-day stats: trades by source/trader/sector, win rate, current scoring rules, recent proposals, replay reports.
+- `GET /dashboard/status` — P&L summary, open positions count, system health (heartbeats, broker connection state).
+
+**Write path: `POST /scoring-proposals`** — used only by `weekly-synthesis`. Body is a structured proposal `{rule, current_value, proposed_value, rationale, supporting_stats, replay_report_id}`. The endpoint inserts a row into the `scoring_proposals` table (status `pending`); a human reviewer adopts or rejects via a separate workflow. Skills never mutate `scoring_rules` directly — proposed → adopted is gated by replay results and human review (§5.5).
+
+**Auth.** All `/dashboard/*` and `/scoring-proposals` endpoints require `Authorization: Bearer <token>`. The token is signed via `itsdangerous`; each Routine has it set as the `API_BEARER_TOKEN` environment variable (set in the Routine config in `claude.ai/code/routines`, never committed to the repo).
+
+**Per-trade data.** The DB schema for `signals`, `positions`, and the closed-trade view holds the same fields formerly carried in vault frontmatter — see §7 for the full per-trade schema.
 
 > [!tip] Why `mode: paper|live` matters
-> Every Dataview query, every Cowork prompt, every report filters on this field. When you migrate, you don't change anything about how data is stored — paper and live just live side-by-side and queries pick which to look at. You can even run them in parallel: paper continues validating new rule changes while live runs the validated rules.
+> Every dashboard query, every skill, every report filters on this field. When you migrate, you don't change anything about how data is stored — paper and live live side-by-side in the same tables and queries pick which to look at. You can run them in parallel: paper continues validating new rule changes while live runs the validated rules.
 
 ### 5.4 Discord
 
@@ -308,148 +290,57 @@ Three primary channels plus an ops channel, one webhook each:
 - `#system-health` — ingestor heartbeats, reconciler repairs, broker reconnect alerts.
 
 A small bot (~80 lines, `discord.py`) handles slash commands:
-- `/thesis TICKER` — reads `01 Watchlist/TICKER.md`, posts thesis.
-- `/positions` — lists open positions from `02 Open Positions/`.
-- `/snooze TICKER 7d` — adds a snooze entry to `99 Meta/snoozed.md` so the scorer ignores that ticker for 7 days.
+- `/thesis TICKER` — reads the latest thesis row for the ticker from the DB and posts it.
+- `/positions` — lists open positions from the `positions` table.
+- `/snooze TICKER 7d` — inserts a snooze row in the `snoozes` table so the scorer ignores that ticker for 7 days.
 - `/pnl` — paper-mode equity curve summary.
 - `/confirm <id>` and `/skip <id> reason: …` — order confirmation flow (§5.9).
 - `/heartbeat` — surfaces per-ingestor heartbeat ages (drives external monitoring).
 
-### 5.5 Cowork Scheduled Tasks
+### 5.5 Claude Code Routines
 
-Four scheduled tasks. Keep prompts in `Templates/` so you version them with the rest of the vault.
+Four scheduled Routines plus one on-demand skill. Each Routine is registered once via `/schedule` from a `claude` session at the bedcrock repo root; from then on it runs on Anthropic's cloud regardless of laptop state. Routine env vars (`API_BASE_URL`, `API_BEARER_TOKEN`, `DISCORD_WEBHOOK_*`) are configured per-Routine at `claude.ai/code/routines`.
 
-#### Morning Heavy Run — daily, 08:00 ET (90 min before US open)
+#### Morning Run — weekdays, 06:30 ET (3 hours before US open)
 
-```
-You are running the morning heavy analysis. Today is {{date}}.
+Routine fires the `morning-analyze` skill. The skill:
+1. Pulls `/dashboard/morning` for overnight signals, open positions, today's earnings calendar, regime snapshot, and gates that blocked entries yesterday.
+2. Tags the day's `market_regime` (`bull_low_vix | bull_high_vix | bear_low_vix | bear_high_vix`) and notes any 48h macro events.
+3. For each high-score candidate (score ≥ threshold), confirms its indicators are fresh (`computed_at` ≤ 24h), then drafts a thesis: bull case, bear case, technical levels from the cached indicators, entry zone (stop never tighter than 1.5×ATR_20), invalidation level, profit targets.
+4. Posts a single "ACT TODAY / WATCH TODAY / PASSIVE" gameplan embed to `#high-score`. Each ACT TODAY item is a hint to the human; the backend already has the corresponding scored signal in the DB and will draft a bracket order on confirm (§5.9).
 
-Step 1 — Sweep:
-Read every file in ~/Obsidian/Trading/00 Inbox/ where status: new
-AND no blocking gate is set. Skip files where gate_blocked: true
-unless the gate is overrideable and the override flag is set.
-Read all files in 01 Watchlist/ whose frontmatter score changed in the
-last 24h. Read 02 Open Positions/ in full.
+#### Intraday Check — weekdays, 12:00 ET and 14:00 ET
 
-Step 2 — Regime context:
-Fetch overnight ES/NQ futures, Asia and Europe session moves, VIX,
-DXY, US 10Y yield, and today's macro calendar (Fed speakers, CPI,
-NFP, etc.). Note any events within 48h that could move the book.
-Tag the day's market_regime (bull_low_vix | bull_high_vix |
-bear_low_vix | bear_high_vix). Write findings to
-05 Daily/{{date}}-regime.md.
+Routine fires the `intraday-check` skill. The skill pulls `/dashboard/intraday`:
+1. For each open position, checks distance to stop/target and any news in the last 3h. Alerts to `#position-alerts` if anything is approaching its level.
+2. Pulls signals scored above `URGENT_THRESHOLD` since the last run; posts a compressed thesis (5–7 sentences) to `#high-score` if any.
+3. Stays light — should finish in well under 5 minutes. Does not rebuild the morning thesis or touch closed positions.
 
-Step 3 — Per-candidate thesis build:
-For each high-score candidate (score >= threshold from
-99 Meta/scoring-rules.md), read its indicators block from the
-watchlist note. Reject if indicators stale (computed_at > 24h ago).
-Write or update 01 Watchlist/<TICKER>.md with: bull case, bear case,
-technical levels (use the swing_high_90d / swing_low_90d / SMAs from
-the indicators), catalyst calendar 30d out, position sizing relative
-to current book (check correlation gate), entry zone (must respect
-ATR — stop never tighter than 1.5x ATR_20), invalidation level,
-profit targets. Follow [[trader]] wikilinks for context on the
-originator's history with this name.
+#### Hourly Closure — weekdays, top of the hour 10:00–16:00 ET
 
-Step 4 — Game plan:
-Write 05 Daily/{{date}}-gameplan.md with three sections:
-  - ACT TODAY: specific orders for the backend to draft, with size,
-    entry zone, stop, target, and the setup tag (breakout | pullback
-    | base | mean_reversion | none)
-  - WATCH TODAY: price levels that would activate something
-  - PASSIVE: no action unless specific event hits
+Routine fires the `hourly-closure` skill. The skill pulls `/dashboard/closures?hours=1`:
+1. For each fresh closure event, drafts a post-mortem (entry/exit/pnl, mechanism vs. direction, original signal vs. actual driver, return vs. SPY and sector ETF, one specific lesson).
+2. Posts a compact summary to `#position-alerts`. Closure rows in the DB are updated with the post-mortem text and a `processed_at` timestamp so the next run skips them.
+3. If a lesson suggests a scoring change, the skill defers the proposal to the weekly run rather than POSTing immediately — keeps the proposal volume manageable and lets weekly evaluate against replay results.
 
-Step 5 — Hand off to backend:
-For each ACT TODAY entry, write a corresponding row to
-00 Inbox/orders/<id>.md with status: ready_for_draft. The backend
-will pick these up, run final gates, construct bracket orders, and
-post one-click confirm embeds to #high-score for you to confirm
-or skip via Discord.
+#### Weekly Synthesis — Sunday 19:00 ET
 
-Step 6 — Mark inbox files processed.
-```
+Routine fires the `weekly-synthesis` skill. The skill pulls `/dashboard/weekly` (last 30 days of closes, current scoring rules, pending proposals, recent replay reports):
+1. Computes per-trader, per-source, per-sector stats: win rate, avg return, avg excess vs. SPY, avg holding period, Sharpe-like ratio.
+2. Identifies top 3 working and top 3 failing patterns.
+3. For each weight change supported by both stats AND a passing replay (out-of-sample Sharpe ≥ baseline), POSTs a structured proposal to `/scoring-proposals` (writes a row to the `scoring_proposals` table for human review).
+4. Phase-gate check: if all Paper Phase 2 graduation criteria are met, posts a "READY FOR LIVE PHASE 1" note to `#high-score`.
+5. Posts a 5-bullet summary to `#high-score`.
 
-#### Intraday Light Runs — daily, 11:00 / 14:00 / 16:30 ET
+#### `status` skill (on-demand)
 
-```
-Light intraday check. Today is {{date}}, run at {{time}}.
-
-1. Read 05 Daily/{{date}}-gameplan.md.
-2. Check current prices for everything in WATCH TODAY. If any
-   level activated, write a brief alert note to 00 Inbox/ flagged
-   urgent: true and post to #high-score.
-3. Read 00 Inbox/ for new signals since the last run. If any
-   has score >= URGENT_THRESHOLD from scoring-rules.md, do a
-   compressed thesis build (5-7 sentences) and post to #high-score.
-4. Re-check open positions: any approaching stop/target, any news
-   in the last 3h. If yes, alert in #position-alerts.
-5. Append a short "intraday note" to 05 Daily/{{date}}-intraday.md.
-
-Do NOT rebuild the morning thesis. Do NOT touch closed positions.
-Stay light — this run should finish in <5 minutes.
-```
-
-#### Hourly Closure Run — hourly, market hours + 1h after
-
-```
-Process closure events.
-
-1. Read 00 Inbox/ for files with type: closure and status: new.
-   These are written by the live monitor when a paper or live
-   position closes.
-2. For each, write a post-mortem to 03 Closed/<DATE>-<TICKER>.md
-   with the schema in 99 Meta/templates. Include:
-   - Entry/exit/pnl
-   - Why it worked or didn't (mechanism, not just direction)
-   - Original signal predicted vs. actual driver
-   - Compare return to SPY and sector ETF over same window
-   - One specific lesson (concrete rule change, not vague)
-3. If the lesson suggests a scoring weight change, append a
-   proposal to 99 Meta/scoring-rules-proposed.md. Do NOT modify
-   scoring-rules.md directly — the weekly synthesis adopts proposals.
-4. Mark closure inbox files processed.
-5. Post a compact summary to #position-alerts.
-```
-
-#### Weekly Synthesis — Sunday 18:00 local
-
-```
-System-level learning pass.
-
-1. Read every file in 03 Closed/ with exit_date in the last 30 days.
-2. Read 99 Meta/scoring-rules.md (current) and scoring-rules-proposed.md
-   (proposals from the closure runs). For each proposal, read the
-   matching mini-backtester replay report from
-   06 Weekly/{{date}}-replay-{rule}.md (written by the EOD worker —
-   see "Mini-backtester" below).
-3. Compute per-trader, per-source, per-sector stats:
-   - Win rate
-   - Average return
-   - Average return vs. SPY
-   - Average holding period
-   - Sharpe-like ratio
-4. Write 06 Weekly/{{date}}-synthesis.md with:
-   - Top 3 working signal patterns
-   - Top 3 failing signal patterns (candidates for removal/dampening)
-   - Whether each proposed rule change in scoring-rules-proposed.md
-     is supported by data; for each, recommend ADOPT or REJECT, citing
-     both the closed-trade stats AND the replay's
-     ADOPT/REJECT/INCONCLUSIVE recommendation
-5. If recommending ADOPT, update 99 Meta/scoring-rules.md, append
-   to 99 Meta/changelog.md with rationale, and clear the relevant
-   line from scoring-rules-proposed.md.
-6. Phase-gate check: read 99 Meta/risk-limits.md and the synthesis
-   stats. If we're in Paper Phase 2 and all graduation criteria
-   are met (see §4 of system plan), post a "READY FOR LIVE PHASE 1"
-   note to #high-score with the supporting numbers.
-7. Post a 5-bullet summary of the synthesis to #high-score.
-```
+Not on a schedule. Invoked manually via `/status` in a `claude` session. Pulls `/dashboard/status` and posts a one-screen summary: P&L, open positions count, ingestor heartbeats, broker connection state. Useful for checking the system from a phone via `claude remote-control`.
 
 #### Mini-backtester (N4)
 
-The weekly synthesis depends on a mini-backtester at `src/backtest/replay.py` that re-scores past signals (already in the DB) under a proposed weight set, simulates entries/exits at OHLCV boundaries, and reports the Sharpe delta. This exists because v1's "paper trading IS the backtest" philosophy is defensible for the signal universe (politician trades, insider buys are hard to backtest faithfully) but breaks down for *evaluating weight changes*: with 50 trades, a 1-point change on `cluster_per_extra_source` is statistically indistinguishable from noise.
+Weekly synthesis depends on a mini-backtester at `src/backtest/replay.py` that re-scores past signals (already in the DB) under a proposed weight set, simulates entries/exits at OHLCV boundaries, and reports the Sharpe delta. This exists because v1's "paper trading IS the backtest" philosophy is defensible for the signal universe (politician trades, insider buys are hard to backtest faithfully) but breaks down for *evaluating weight changes*: with 50 trades, a 1-point change on `cluster_per_extra_source` is statistically indistinguishable from noise.
 
-The replay tool guards against overfitting by reserving the last 30 days of signals as out-of-sample, reporting both in-sample and out-of-sample Sharpe, and refusing to recommend ADOPT unless out-of-sample Sharpe beats the baseline. Entry rule is T+1 OPEN, exit is OCO at a configurable stop loss (default 10%) or target (default 1.5R) or timeout (default 30 days). Slippage is a flat-bps assumption. The output is a `ReplayReport` written to `06 Weekly/{date}-replay-{rule}.md` with an ADOPT / REJECT / INCONCLUSIVE recommendation that the human-confirmed weekly synthesis uses as one input — never the sole input.
+The replay tool guards against overfitting by reserving the last 30 days of signals as out-of-sample, reporting both in-sample and out-of-sample Sharpe, and refusing to recommend ADOPT unless out-of-sample Sharpe beats the baseline. Entry rule is T+1 OPEN, exit is OCO at a configurable stop loss (default 10%) or target (default 1.5R) or timeout (default 30 days). Slippage is a flat-bps assumption. The output is a `ReplayReport` row written to the `scoring_replay_reports` table by the EOD worker, with an ADOPT / REJECT / INCONCLUSIVE recommendation that the weekly-synthesis skill uses as one input — never the sole input.
 
 Caveats baked into the module: historical OHLCV only (no bid/ask depth), constant slippage, no survivorship-bias correction (yfinance acknowledged). It's a sanity check, not a Monte Carlo. Treat the recommendation as advisory.
 
@@ -462,9 +353,9 @@ A long-running Python process on the VPS:
 - **Idempotency by construction.** `_on_entry_fill` first checks `SELECT Position WHERE broker_order_id = ?`; if a row already exists (because the WS handler beat the polling reconciler, or vice versa), it logs and returns instead of inserting a duplicate. Defense in depth: `Position.broker_order_id` has a `UNIQUE` constraint at the DB layer, so a second insert would error rather than corrupt.
 - **Startup reconciliation against IBKR (invariant 7).** On `LiveMonitor.start()`, after broker connect and before the event loop begins, runs `_reconcile_against_broker`: any IBKR position not in the DB raises an `orphan_ibkr_position` alert and an `AuditLog` row; any open DB position the broker has no record of is marked `status=CLOSED, close_reason=EXTERNAL`. This catches the "worker crashed between `placeOrder` and writing the Position row" failure mode and the "user closed via mobile app" case.
 - **Reconciler audit (invariant 8).** Every 30s, walks `ib.openTrades()` and re-issues any child order with `tif != "GTC"` as GTC + `outsideRth=True`. Posts a `#system-health` alert per repair.
-- On every tick, updates the position file with the current price and unrealized P&L (so the dashboard is always live).
-- On stop or target fill received from broker, writes a closure event to `00 Inbox/` flagged `type: closure`, updates `02 Open Positions/` → moves the file to `03 Closed/`, and posts to `#position-alerts`.
-- Re-reads `02 Open Positions/` every 30 seconds so newly-opened positions get monitored automatically.
+- On every tick, updates the position row with the current price and unrealized P&L (so the dashboard endpoints are always live).
+- On stop or target fill received from broker, writes a closure event row, transitions the position to `status=CLOSED`, and posts to `#position-alerts`. The next `hourly-closure` Routine picks up the closure row and writes the post-mortem.
+- Re-queries the open positions list every 30 seconds so newly-opened positions get monitored automatically.
 - Heartbeat: posts a status message to `#system-health` every 15 min during market hours so you can see it's alive.
 - **Daily P&L computation (F5).** A `daily_pnl` worker computes `daily_pnl_pct = (current_equity - start_of_day_equity) / start_of_day_equity × 100` once a minute during market hours and stashes it in a small `DailyState` table keyed on `(date, mode)`. The `daily_kill_switch` gate reads from this table — when `daily_pnl_pct ≤ -RISK_DAILY_LOSS_PCT` (default -2%), the gate blocks all new entries until next session. Override is **not** allowed.
 
@@ -479,7 +370,7 @@ Every signal must pass these gates before it can escalate to `#high-score` or ap
 | **Scheduled event proximity** | No entry within 2 trading days of FOMC, CPI, NFP, or known FDA/contract dates for the ticker | Manual override allowed |
 | **Sector correlation** | New position would push portfolio's largest sector concentration over 25% of equity (`RISK_SECTOR_CONCENTRATION_LIMIT`) | Manual override allowed with thesis justification |
 | **Stale signal** | Signal more than 14 days old at first surfacing (handles backlogged disclosures hitting late) | Manual override |
-| **Snoozed ticker** | Ticker is in `99 Meta/snoozed.md` | Lift snooze in Discord (`/snooze TICKER 0`) |
+| **Snoozed ticker** | Ticker has an active row in the `snoozes` table | Lift snooze in Discord (`/snooze TICKER 0`) |
 | **Daily loss kill switch** | Account at or below the day's loss limit (default -2%) | Resets next session |
 | **Open positions cap** | Already at max open positions for the phase | Close something or wait |
 
@@ -507,7 +398,7 @@ This is **a filter and timing layer, not a signal source.** Don't let it generat
 | 20-day high / 20-day low | Breakout / breakdown reference levels |
 | Recent swing levels (last 90 days) | Support and resistance for entry zones and stops |
 
-These are written into the watchlist note's frontmatter, so Cowork sees them as structured data, not raw OHLCV:
+These are written into the `indicators` table per ticker, so the morning skill sees them as structured data via `/dashboard/morning`, not raw OHLCV:
 
 ```yaml
 indicators:
@@ -526,7 +417,7 @@ indicators:
   setup: pullback_to_50sma  # one of: breakout, pullback, base, none
 ```
 
-**What Cowork does with them.** The morning prompt asks Claude to interpret these in context: is the entry zone a sensible level given the swing structure, does the 1.5×ATR stop give the trade room without risking too much, is the relative strength supportive of the thesis. Claude *interprets*; it doesn't compute. The numbers come from the backend.
+**What the morning skill does with them.** The skill asks Claude to interpret these in context: is the entry zone a sensible level given the swing structure, does the 1.5×ATR stop give the trade room without risking too much, is the relative strength supportive of the thesis. Claude *interprets*; it doesn't compute. The numbers come from the backend.
 
 **What's deliberately excluded.** Candlestick pattern catalogs, Fibonacci retracements, Elliott Wave, multi-indicator crossover systems. These have weak empirical support as standalone alpha and would dilute the system's actual edge (the signal cluster). Resist adding them.
 
@@ -538,13 +429,13 @@ The execution layer is deliberately split so the human is the trigger, but never
 
 **Step-by-step:**
 
-1. **Cowork morning run** writes `ACT TODAY` to `05 Daily/<date>-gameplan.md` and posts the list to `#high-score` with one Discord embed per candidate.
-2. **Backend prepares draft bracket orders.** For every `ACT TODAY` row, the backend constructs a complete bracket order in memory (limit entry, OCO stop and target attached, calculated quantity, all gate checks passed) and writes a draft order file to `00 Inbox/orders/<id>.md` with status `draft`. It does *not* send it to the broker yet.
+1. **Morning Routine** (`morning-analyze`) posts the gameplan to `#high-score` with one Discord embed per ACT TODAY candidate.
+2. **Backend prepares draft bracket orders.** For every scored signal that the gameplan tags ACT TODAY, the backend constructs a complete bracket order in memory (limit entry, OCO stop and target attached, calculated quantity, all gate checks passed) and writes a `DraftOrder` row in the DB with status `draft`. It does *not* send it to the broker yet.
 3. **Discord prompt to you.** The `#high-score` embed for each candidate has the full order preview (entry, stop, target, size, %risk, gate results) and a clear path to confirm. Two ways to confirm:
-   - **Slash command in Discord:** `/confirm <id>` — bot reads the draft, sends the bracket to the broker, updates the order file to `status: sent`.
+   - **Slash command in Discord:** `/confirm <id>` — bot reads the draft from the DB, sends the bracket to the broker, updates the row to `status: sent`.
    - **Tap-friendly mobile:** the embed includes a deep link `claude-trade://confirm/<id>` (an `itsdangerous`-signed token, expires with the draft) that opens a tiny local web UI showing the order, with a single "Send to broker" button. Best on phone — tap it from bed at 8:15 ET, done.
 4. **Broker fills**, `execDetailsEvent` fires, live monitor catches it (idempotent — see §5.6), position file written, `#position-alerts` ping. From this moment on, the OCO at the broker (GTC by construction) manages the exit.
-5. **Skipping a trade is also one click.** `/skip <id> reason: earnings-too-close` writes `status: skipped` and the reason to the order file. Skipped orders feed the weekly synthesis the same as taken ones — "would I have made money on the trades I skipped?" is one of the most useful questions the system can answer.
+5. **Skipping a trade is also one click.** `/skip <id> reason: earnings-too-close` updates the draft row to `status: skipped` with the reason. Skipped orders feed the weekly synthesis the same as taken ones — "would I have made money on the trades I skipped?" is one of the most useful questions the system can answer.
 
 **Position sizing.** Risk-based: `qty = (equity × RISK_PER_TRADE_PCT / 100) / |entry - stop|`. Stop is ATR-floored at 1.5× ATR_20 — auto-widened if the supplied stop is tighter. Then a **half-Kelly per-position concentration cap (N3)** is applied: `qty = min(qty_by_risk, (equity × RISK_MAX_POSITION_SIZE_PCT) / entry)`. This defends against pathological tight-stop sizing where a 1%-risk trade with a tiny stop becomes a 20%-of-equity position — risk *per trade* stays at 1%, but a halt or earnings shock crosses the stop and you eat the *full* position size as the loss. Default cap is 5% (`RISK_MAX_POSITION_SIZE_PCT=0.05`); Live Phase 1 overrides to 3% per §10.
 
@@ -560,7 +451,7 @@ The execution layer is deliberately split so the human is the trigger, but never
 - Override a hard gate
 
 **What the bot *will* do without a click:**
-- Trail or move stops *only if* the position file's `auto_trail` flag is true and the rule is in `99 Meta/risk-limits.md` (e.g., "move stop to break-even after +1R"). Default off; you turn it on per-position.
+- Trail or move stops *only if* the position row's `auto_trail` flag is true and the rule is configured (e.g., "move stop to break-even after +1R"). Default off; you turn it on per-position.
 - Close at stop or target via the pre-set OCO at the broker. (The broker enforces; the bot just records.)
 - Cancel stale draft orders at end of day.
 - Hit the daily kill switch on -2% drawdown.
@@ -587,8 +478,8 @@ Every entry is a **bracket order**: limit entry + OCO (one-cancels-other) stop l
 
 The execution flow (from §5.9, restated for completeness):
 
-1. Cowork's morning gameplan lists the candidate.
-2. Backend constructs the full bracket draft, runs all gates, writes it to `00 Inbox/orders/<id>.md` as `status: draft`. Discord posts the preview embed to `#high-score`.
+1. The morning Routine's gameplan lists the candidate.
+2. Backend constructs the full bracket draft, runs all gates, writes it to the `draft_orders` table as `status: draft`. Discord posts the preview embed to `#high-score`.
 3. **You click confirm** — `/confirm <id>` in Discord, or tap the deep link to the local web UI. One action, no fields to fill.
 4. Backend sends the bracket to IBKR. `client_order_id` is set to the `DraftOrder.id` UUID, so a duplicate confirm is rejected by the broker.
 5. IBKR fills the entry; OCO sits server-side and will fire on stop or target *even if your VPS is offline* (because GTC).
@@ -602,13 +493,13 @@ Don't take mid-price as your fill in paper. IBKR's paper sim is mildly optimisti
 - Market orders (used only for closes if OCO doesn't fire): fill at ask + 5bps (buy) or bid - 5bps (sell), plus 2bps for assumed market impact on size > $5k.
 - For tickers with 30-day ADV below 500k shares: halve simulated fill size and add 10bps slippage.
 
-Adjust these constants in `99 Meta/risk-limits.md` after Live Phase 1 based on observed slippage. The point is to make paper *pessimistic*, not optimistic — you want live results to surprise you positively, not the other way around.
+Adjust these constants in the risk-limits config after Live Phase 1 based on observed slippage. The point is to make paper *pessimistic*, not optimistic — you want live results to surprise you positively, not the other way around.
 
 ### 6.4 Equity Tracking
 
 Starting paper equity: **$100k**. Don't match it to your intended live size — you're testing the strategy, not the size. Sizing scales with equity in both modes via the `risk-limits.md` percentages.
 
-Backend writes daily equity snapshots to `99 Meta/equity-curve.csv` and to the `EquitySnapshot` DB table:
+Backend writes daily equity snapshots to the `EquitySnapshot` DB table:
 
 ```csv
 date,mode,equity,cash,positions_value,daily_pnl,daily_pnl_pct
@@ -616,11 +507,11 @@ date,mode,equity,cash,positions_value,daily_pnl,daily_pnl_pct
 2026-05-03,live,25000.00,25000.00,0.00,0.00,0.00
 ```
 
-Sharpe, drawdown, and phase-gate calculations read from this CSV. Once live is running, paper continues in parallel for at least 30 days so you have a head-to-head comparison.
+Sharpe, drawdown, and phase-gate calculations read from this table. Once live is running, paper continues in parallel for at least 30 days so you have a head-to-head comparison.
 
 ### 6.5 The "Do Nothing" Baseline
 
-Run a parallel paper portfolio that just buys SPY equal-weight every time the system would have entered. Same sizing, same hold periods, same exits driven by SPY's behavior on those dates. Track its equity curve in `99 Meta/equity-curve.csv` with `mode: baseline`. If your system's risk-adjusted return doesn't beat this baseline net of stress and effort, that's important to know early — and you'll only know if you tracked it from day one.
+Run a parallel paper portfolio that just buys SPY equal-weight every time the system would have entered. Same sizing, same hold periods, same exits driven by SPY's behavior on those dates. Track its equity curve in `EquitySnapshot` with `mode: baseline`. If your system's risk-adjusted return doesn't beat this baseline net of stress and effort, that's important to know early — and you'll only know if you tracked it from day one.
 
 ---
 
@@ -676,7 +567,7 @@ thesis_held: true            # did the original mechanism actually drive the mov
 notes: "..."
 ```
 
-The weekly synthesis aggregates these across `mode: paper` for paper performance and `mode: live` for live performance. When you graduate to live, the same Dataview queries just start returning live data alongside paper.
+The weekly synthesis aggregates these across `mode: paper` for paper performance and `mode: live` for live performance. When you graduate to live, the same `/dashboard/weekly` queries just start returning live data alongside paper.
 
 ---
 
@@ -706,7 +597,7 @@ Urgent threshold for intraday: 8.0.
 
 **Hard gates from §5.7 are applied after scoring.** A signal can have a score of 9 and still be blocked by the earnings-proximity gate. Blocked signals are logged with their score and the gate that blocked them, so the weekly synthesis can validate the gates.
 
-All thresholds and weights live in `99 Meta/scoring-rules.md`. Every change goes through the proposed → adopted flow in §5.5 — and proposals are validated by the mini-backtester replay (§5.5) before adoption.
+All thresholds and weights live in the `scoring_rules` table (seeded from `config/scoring-rules.yaml`). Every change goes through the proposed → adopted flow in §5.5 — proposals are written to `scoring_proposals` by the weekly skill, validated by the mini-backtester replay (§5.5), and human-reviewed before being applied to `scoring_rules`.
 
 ---
 
@@ -746,7 +637,7 @@ These bind from Live Phase 1 onward. Paper has no real risk but you should still
 | Weekly loss → revert phase | -5% | -7% |
 | Max correlated exposure | 0.7 portfolio beta | 1.0 |
 
-The position-size cap is enforced by the half-Kelly logic in §5.9 — it binds whenever `qty_by_concentration < qty_by_risk`, which happens on tight-stop trades. The sector concentration limit is enforced by the gate in §5.7. The daily loss kill switch is enforced by the gate (which reads the live-monitor-populated `DailyState`, see §5.6); on trip, new entries are refused until next session and Cowork still does its analysis runs but flags everything as `acted: false` in the position frontmatter.
+The position-size cap is enforced by the half-Kelly logic in §5.9 — it binds whenever `qty_by_concentration < qty_by_risk`, which happens on tight-stop trades. The sector concentration limit is enforced by the gate in §5.7. The daily loss kill switch is enforced by the gate (which reads the live-monitor-populated `DailyState`, see §5.6); on trip, new entries are refused until next session and the Routines still run but the dashboard endpoints flag the day as `acted: false`.
 
 **Backstop:** also set IBKR account-level risk limits via TWS → Configure → Account → Risk Limits → Daily Loss = 2% of NLV. This is broker-side and fires even if the bot is misconfigured.
 
@@ -757,19 +648,19 @@ The position-size cap is enforced by the half-Kelly logic in §5.9 — it binds 
 Don't try to build everything in week one. The order matters because each step de-risks the next.
 
 **Week 1 — Skeleton.**
-Vault structure, frontmatter templates, Discord webhooks, one ingestor (Capitol Trades or SEC Form 4), backend writes to `00 Inbox/`. **Add the earnings calendar ingestor and OHLCV fetcher in this same week** — they're cheap and needed by the gates. Daily git backup of vault. End-to-end signal flowing into the vault and into Discord. No Cowork yet.
+Postgres schema + alembic, Discord webhooks, one ingestor (Capitol Trades or SEC Form 4), backend persists scored signals to the DB and posts to `#signals-firehose`. **Add the earnings calendar ingestor and OHLCV fetcher in this same week** — they're cheap and needed by the gates. Nightly `pg_dump` to private object store. End-to-end signal flowing into the DB and into Discord. No reasoning layer yet.
 
-**Week 2 — Cowork morning run + indicator layer.**
-Backend computes indicators (§5.8) and writes them to watchlist frontmatter. Morning heavy run consumes them. Generate hypothetical game plans without placing orders. Build feel for prompt quality.
+**Week 2 — FastAPI dashboard + Claude Code skills + first Routine.**
+Backend computes indicators (§5.8) and writes them to the `indicators` table. Stand up the `/dashboard/*` read endpoints (§5.3) behind bearer auth. Author the `morning-analyze` and `status` skills under `.claude/skills/`. Register the morning Routine via `/schedule` from a `claude` session at the repo root. Generate hypothetical gameplans without placing orders. Build feel for skill output quality.
 
 **Week 3 — IBKR paper integration + safety scaffold + one-click confirm + live monitor + hard gates.**
 Bracket order construction with GTC children, draft order writing, Discord `/confirm` slash command, signed deep-link mobile UI. Live monitor with idempotent `_on_entry_fill`, startup reconciliation, and the GTC-audit reconciler. Hard gates from §5.7 wired in including the sector-correlation gate. Daily P&L worker populating `DailyState`. SPY baseline portfolio starts tracking. **End of Paper Phase 1 starts here.**
 
-**Weeks 4–6 — Add ingestors, heavy-movement, and tune.**
-13F (WhaleWisdom or 13F.info), more Form 4 coverage, options flow if you have UW, X list. Heavy-movement ingestor running. Add the intraday light runs. Tune scoring weights manually as you see signal quality. Hit the Phase 1 graduation criteria (§4.1).
+**Weeks 4–6 — Add ingestors, heavy-movement, remaining Routines, and tune.**
+13F (WhaleWisdom or 13F.info), more Form 4 coverage, options flow if you have UW, X list. Heavy-movement ingestor running. Author and register the `intraday-check` and `hourly-closure` skills as Routines. Tune scoring weights manually as you see signal quality. Hit the Phase 1 graduation criteria (§4.1).
 
 **Weeks 7–18 — Paper Phase 2.**
-Weekly synthesis runs. Mini-backtester replay validates each proposed weight change. Don't add new sources unless one is clearly missing. Add news/sentiment modifier mid-Phase 2 if a clear gap shows up in the data. Focus on rule refinements via the proposed/adopted loop. Hit migration criteria (§4.2).
+Register the `weekly-synthesis` Routine; it POSTs scoring proposals to `/scoring-proposals`. Mini-backtester replay validates each proposed weight change. Don't add new sources unless one is clearly missing. Add news/sentiment modifier mid-Phase 2 if a clear gap shows up in the data. Focus on rule refinements via the proposed/adopted loop. Hit migration criteria (§4.2).
 
 **Weeks 19+ — Live Phase 1, then 2.**
 Flip `MODE=live` and `IBKR_PORT=4001`. Keep paper running in parallel for 30 days minimum. Compare paper vs. live Sharpe weekly. Hit §4.3.
@@ -783,10 +674,9 @@ Flip `MODE=live` and `IBKR_PORT=4001`. Keep paper running in parallel for 30 day
 
 | Failure | Mitigation |
 |---|---|
-| Cowork run fails silently (laptop asleep) | Backend pings `#high-score` if no run output appears in `05 Daily/` within 30 min of scheduled time |
+| Routine fails silently | Each skill's first action is to mark a `routine_runs` row at start; the backend pings `#system-health` if no end-marker appears within the expected window of a scheduled Routine. Routine logs are also viewable at `claude.ai/code/routines`. |
 | Backend crashes overnight | systemd auto-restart + healthcheck endpoint + Discord ping on restart |
-| Vault sync conflict | Inbox-then-process pattern (invariant 4) prevents this by design; if it ever happens, Cowork's prompt rejects the run and pings you |
-| Vault corruption / lost | Daily `git commit` of the vault to a private repo via cron; full recovery by clone |
+| DB corruption / lost | Nightly `pg_dump` to a private object store; restore is a single `pg_restore`. |
 | IB Gateway nightly logout (23:45–00:45 ET) | IBC handles auto-relogin; `LiveMonitor` tolerates ~5min disconnect; connection retry with exponential backoff on reconnect |
 | IBKR API outage during live monitor | Live monitor caches last known prices, refuses to open new positions, alerts to `#system-health`; existing stops handled by GTC OCO at the broker |
 | Worker crashed between `placeOrder` and Position write | Startup reconciliation (§5.6, invariant 7) catches the orphan and posts an alert |
@@ -797,7 +687,7 @@ Flip `MODE=live` and `IBKR_PORT=4001`. Keep paper running in parallel for 30 day
 | Signal source goes quiet (scraper breaks) | Per-source heartbeat; if no signals from source X in N hours during market hours, Discord alert |
 | Scoring drift (rules change too fast) | Hard-cap: max one weight change per weekly synthesis. Mini-backtester replay must show out-of-sample Sharpe ≥ baseline before adopt. Changelog reviewed before any live phase advance |
 | Overfitting to paper | The 30%-Sharpe-degradation guardrail in §4 catches this; if breached, drop back to Live Phase 1 sizing and re-run paper for 4 weeks |
-| Stale indicator cache | Backend stamps every indicator block with `computed_at`; Cowork prompt rejects watchlist entries whose indicators are >24h old and re-fetches |
+| Stale indicator cache | Backend stamps every indicator row with `computed_at`; the morning skill rejects watchlist entries whose indicators are >24h old and triggers a re-fetch via the backend. |
 | Stale draft order never confirmed | Drafts auto-expire at end of regular session; Discord summary lists what was skipped vs. expired |
 | Travel / timezone confusion | Backend and all scheduled tasks anchor to ET regardless of laptop TZ; phone reminders sent in your local TZ separately |
 | Earnings/event calendar miss | Gates fail-closed — if the earnings API call fails, the gate blocks the trade rather than passing it. Manual override available |
@@ -814,7 +704,7 @@ Flip `MODE=live` and `IBKR_PORT=4001`. Keep paper running in parallel for 30 day
 - Selling signals or letting others trade off your system.
 - Tax optimization (wash sales, lot accounting). Real concern for live but a separate workstream.
 - Tier-2 (software) hard-stop monitor. Bedcrock's broker-side-OCO-only design is intentional — no double-sell race possible. Don't add complexity that has to be defended against itself.
-- Inline `anthropic` SDK call per signal. Breaks the Cowork-via-vault decoupling. The four-times-daily Cowork cadence already covers the latency need.
+- Inline `anthropic` SDK call per signal. Breaks the Routines-via-FastAPI decoupling. The four-times-daily Routine cadence already covers the latency need.
 - ARK as a primary signal source. Research found -34% MWR 2020–2025; not worth weighting.
 
 ---
@@ -827,62 +717,13 @@ Flip `MODE=live` and `IBKR_PORT=4001`. Keep paper running in parallel for 30 day
 - IBKR is the broker for both paper and live. Operationally that means living with IB Gateway's desktop-app heritage (IBC, Xvfb, nightly logout). Documented in `docs/DEPLOYMENT.md`; tolerable but not invisible.
 - `yfinance` (the OHLCV fallback when Polygon is unavailable) overstates returns for speculative-universe backtests by 1–4%/yr because delisted symbols disappear. Acceptable for *live* indicator computation; if a future v0.3 builds a primary backtester it should use Norgate or CRSP instead.
 - The mini-backtester (§5.5) uses historical OHLCV only — no bid/ask depth, constant slippage, no survivorship correction. Treat its ADOPT/REJECT/INCONCLUSIVE recommendation as advisory input to the human-confirmed weekly synthesis, not as a decision oracle.
-- This document is a starting point. Treat `99 Meta/changelog.md` as the canonical record once the system is running — this plan is just the bootstrap.
+- This document is a starting point. Treat the `scoring_rules` history rows + git log as the canonical record once the system is running — this plan is just the bootstrap.
 
 ---
 
-## Appendix A — Dataview Queries
+## Appendix A — Dashboards
 
-Drop these into a dashboard note (`Dashboard.md`) for live system state.
-
-**Active high-score watchlist:**
-````dataview
-TABLE ticker, score, trader, disclosed_at
-FROM "00 Inbox"
-WHERE type = "signal" AND status = "new" AND score >= 5
-SORT score DESC
-````
-
-**Open paper positions:**
-````dataview
-TABLE ticker, entry_date, entry_price, stop, target
-FROM "02 Open Positions"
-WHERE status = "open" AND mode = "paper"
-SORT entry_date DESC
-````
-
-**Last 30 days closed paper trades:**
-````dataview
-TABLE ticker, pnl_pct, excess_vs_spy_pct, close_reason, holding_days
-FROM "03 Closed"
-WHERE mode = "paper" AND exit_date >= date(today) - dur(30 days)
-SORT exit_date DESC
-````
-
-**Per-trader paper performance:**
-````dataview
-TABLE
-  length(rows) as trades,
-  round(sum(rows.pnl_pct) / length(rows), 2) as avg_pnl,
-  round(sum(rows.excess_vs_spy_pct) / length(rows), 2) as avg_excess
-FROM "03 Closed"
-WHERE mode = "paper"
-GROUP BY trader_primary
-SORT avg_excess DESC
-````
-
----
-
-## Appendix B — File Naming Conventions
-
-- Inbox signals: `00 Inbox/YYYY-MM-DD-TICKER-source.md` (e.g. `2026-05-02-NVDA-pelosi.md`)
-- Watchlist: `01 Watchlist/TICKER.md` (one per ticker, gets updated)
-- Open positions: `02 Open Positions/TICKER-YYYY-MM-DD.md`
-- Closed: `03 Closed/YYYY-MM-DD-TICKER.md` (date is exit date)
-- Daily: `05 Daily/YYYY-MM-DD-{regime|gameplan|intraday}.md`
-- Weekly: `06 Weekly/YYYY-MM-DD-synthesis.md` and `06 Weekly/YYYY-MM-DD-replay-{rule}.md`
-
-Stable names matter because the Cowork prompts reference paths directly. Don't rename folders without updating prompts and Dataview queries.
+v0.3.0 dropped the Obsidian vault. Equivalent dashboards are exposed via the FastAPI `/dashboard/*` endpoints (§5.3); build a custom dashboard against those endpoints if a visual surface is needed beyond Discord and the Claude Code skills' summaries. The endpoints return JSON suitable for any frontend (Streamlit, Grafana via JSON API, a static SPA, or just `curl | jq` from a terminal).
 
 ---
 
@@ -916,9 +757,35 @@ Three new invariants (now folded into §2 as 7, 8, 9):
 
 **Explicitly NOT ported from Proxy Bot v3:**
 
-- Inline `anthropic` SDK call per signal — breaks the Cowork-via-vault decoupling and the vault-as-source-of-truth invariant.
+- Inline `anthropic` SDK call per signal — breaks the reasoning-via-Routines decoupling. (At v0.2 the framing was "breaks the Cowork-via-vault decoupling"; v0.3 dropped the vault but the architectural objection is the same: ingestors stay deterministic, reasoning stays scheduled.)
 - Tier-2 software hard-stop monitor — bedcrock's broker-side-OCO-only design is *safer* (no double-sell race possible).
 - Convergence-multiplier scoring — bedcrock's additive 9-component scorer is more flexible.
 - SQLite, Telegram, ARK-as-primary-signal.
 
 The previous delta document `bedcrock-plan-v2.md` was deleted during the v0.2.0 → spec consolidation; it is recoverable from git history at commit `1938275` (where v2 was added) if the diff-style record is ever needed.
+
+**v0.3.0 (2026-05-10) — drop the vault and Cowork; reasoning moves to Claude Code Routines.** Triggered by two facts: (1) the v0.2 vault writer at `src/vault/writer.py` was no-op stubs and had been silently broken since v0.1 — production bedcrock had never written anything to the vault; (2) the operator has no Obsidian Sync subscription and no Syncthing, so the vault was not reachable from phone or laptop, collapsing the "human-readable dashboard" rationale. Claude Code 2026's `/schedule` (cloud-hosted Routines) covers the same cadence Cowork provided, on the same Pro/Max subscription, without a desktop product dependency. So instead of restoring the broken layer, the v0.3 refactor deleted it.
+
+Landed across four parallel waves on `v3-staging`. Highlights:
+
+- **Removed `src/vault/`** (writer + frontmatter helpers) and all call sites in the ingest worker and orders monitor — commit `16f4de8`.
+- **Dropped `vault_path` columns** from `Signal` and `Position`; alembic migration `0003_drop_vault.py` also adds the new `scoring_proposals` and `scoring_replay_reports` tables — commits `53daf1b`, `db0d226`.
+- **Refactored `src/workers/eod_worker.py`** to drop vault writes; replay reports now persist as structured rows in `scoring_replay_reports`, and EOD posts a Discord summary instead of writing a daily note — commit `7281b1e`.
+- **Deleted `cowork-prompts/` and `vault-templates/` directories** and pruned `python-frontmatter` from `pyproject.toml` — commit `2bc01d1`.
+- **Added five Claude Code skills** under `.claude/skills/`: `morning-analyze`, `intraday-check`, `hourly-closure`, `weekly-synthesis`, `status` — commit `1686ae1`.
+- **Added five FastAPI dashboard endpoints** (`/dashboard/morning`, `/dashboard/intraday`, `/dashboard/closures`, `/dashboard/weekly`, `/dashboard/status`) and the `POST /scoring-proposals` write path, all behind bearer-token auth — commit `05ec4e9`.
+
+Total lines removed across `src/`, `tests/`, `cowork-prompts/`, `vault-templates/`, and the docs is ~926. The reasoning surface went from "four Cowork prompts triggered by file watchers on a synced vault" to "five SKILL.md files registered as cloud Routines, consuming JSON dashboards over HTTPS." Single source of truth (Postgres). Single reasoning surface (Claude Code). One fewer drift surface, one fewer product dependency, one fewer paid subscription.
+
+**Invariants changed in v0.3:**
+
+- Invariant 2 was *"Cowork is the reasoning layer, not the infrastructure layer"* → now *"Three-layer authority: broker beats DB beats reasoning."* Captures the actual ordering on conflict.
+- Invariant 3 was *"The vault is the source of truth"* → now *"DB is the only durable store."* Postgres is canonical; Routines are stateless consumers.
+- Invariant 4 was *"Inbox-then-process"* (a write-discipline rule for the vault that no longer exists) → now *"Reasoning is stateless and replayable."* The new framing is what actually matters: any Routine can be re-run on the same DB snapshot and reach the same conclusions.
+- Invariants 1, 5–9 unchanged.
+
+**Explicitly NOT done in v0.3** (carried as future considerations):
+
+- A custom MCP server for Postgres. The dashboard endpoints + `psql` via Bash were sufficient and avoid yet another moving part.
+- Migration tooling to rebuild any existing v0.2.0 vault data — there was none in production (the writer never wrote).
+- A custom dashboard frontend. The endpoints exist; build one if/when Discord + skill summaries stop being enough.
