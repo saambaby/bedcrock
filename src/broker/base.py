@@ -13,6 +13,7 @@ BracketOrderSpec (Pydantic model from src.schemas) — both have the same fields
 from __future__ import annotations
 
 import abc
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -57,6 +58,44 @@ class BrokerOrder:
     filled_qty: Decimal
     filled_avg_price: Decimal | None
     submitted_at: datetime
+    raw: dict
+
+
+@dataclass
+class OpenOrder:
+    broker_order_id: str
+    parent_order_id: str | None  # None means it's a parent / standalone
+    ticker: str
+    side: Action
+    order_type: str  # "limit" | "stop" | "stop_limit" | "trailing_stop"
+    quantity: Decimal
+    limit_price: Decimal | None
+    stop_price: Decimal | None
+    tif: str  # "day" | "gtc" | "ioc" | "fok" | "opg" | "cls"
+    raw: dict
+
+
+@dataclass
+class BrokerPosition:
+    ticker: str
+    quantity: Decimal  # signed; negative for short
+    avg_entry_price: Decimal
+    market_value: Decimal | None
+    unrealized_pnl: Decimal | None
+    raw: dict
+
+
+@dataclass
+class TradeUpdate:
+    """One push event from the broker about an order state change."""
+
+    event: str  # "new" | "fill" | "partial_fill" | "canceled" | "rejected" | ...
+    broker_order_id: str
+    client_order_id: str | None
+    ticker: str
+    filled_qty: Decimal
+    filled_avg_price: Decimal | None
+    timestamp: datetime
     raw: dict
 
 
@@ -112,6 +151,35 @@ class BrokerAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def get_last_price(self, ticker: str) -> Decimal | None: ...
+
+    @abc.abstractmethod
+    def iter_open_orders(self) -> AsyncIterator[OpenOrder]:
+        """Yield every open order known to the broker.
+
+        Implementations are async generators (``async def`` with ``yield``).
+        Declared without ``async def`` here so subclasses can be regular
+        async generators — Python doesn't allow abstract async generators
+        declared with both ``@abc.abstractmethod`` and a real ``yield`` body.
+        """
+        ...
+
+    @abc.abstractmethod
+    def iter_positions(self) -> AsyncIterator[BrokerPosition]:
+        """Yield every non-zero broker-side position."""
+        ...
+
+    @abc.abstractmethod
+    async def repair_child_to_gtc(self, broker_order_id: str) -> str:
+        """Re-issue the given child order as GTC. Returns the new broker_order_id."""
+        ...
+
+    def subscribe_trade_updates(self) -> AsyncIterator[TradeUpdate]:
+        """Yield trade updates forever until the underlying stream closes.
+
+        Default implementation raises ``NotImplementedError`` — Wave C wires this
+        per-broker (IBKR event bridge / Alpaca WebSocket).
+        """
+        raise NotImplementedError("subclass must implement subscribe_trade_updates")
 
     async def aclose(self) -> None:
         await self.disconnect()

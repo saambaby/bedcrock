@@ -13,6 +13,27 @@ have no default and the app will refuse to start without them.
 
 ---
 
+## Broker selection
+
+| Variable | Default | Description |
+|---|---|---|
+| `BROKER` | `ibkr` | `ibkr` \| `alpaca`. Selects the adapter `make_broker()` returns. `ibkr` supports paper and live; `alpaca` is paper-only (US-only brokerage; live is refused at boot). |
+
+The validator (`Settings._validate_broker_mode()`) enforces the §3 truth table
+from `docs/V4_ALPACA_PLAN.md`:
+
+| `BROKER` | `MODE` | Boot behaviour / error |
+|---|---|---|
+| `ibkr` | `paper` | OK if `IBKR_PORT ∈ {4002, 7497}`. Otherwise: `IBKR_PORT must be 4002 or 7497 when MODE=paper`. |
+| `ibkr` | `live` | OK if `IBKR_PORT ∈ {4001, 7496}`. Otherwise: `IBKR_PORT must be 4001 or 7496 when MODE=live`. |
+| `alpaca` | `paper` | OK if both `ALPACA_API_KEY` and `ALPACA_API_SECRET` are set. Otherwise: `ALPACA_API_KEY and ALPACA_API_SECRET are required when BROKER=alpaca`. |
+| `alpaca` | `live` | **Refuse.** Error: `Alpaca live brokerage is US-only; use BROKER=ibkr for live in Canada.` |
+
+`IBKR_*` vars are ignored when `BROKER=alpaca`; `ALPACA_*` vars are ignored
+when `BROKER=ibkr`.
+
+---
+
 ## Database
 
 | Variable | Default | Description |
@@ -24,6 +45,7 @@ have no default and the app will refuse to start without them.
 ## Broker — IBKR
 
 IB Gateway or TWS must be running. See `docs/BROKER_SETUP.md` for full setup.
+**All `IBKR_*` vars are ignored when `BROKER=alpaca`.**
 
 | Variable | Default | Description |
 |---|---|---|
@@ -31,6 +53,22 @@ IB Gateway or TWS must be running. See `docs/BROKER_SETUP.md` for full setup.
 | `IBKR_PORT` | `4002` | `4002`/`7497` paper, `4001`/`7496` live. |
 | `IBKR_CLIENT_ID` | `1` | Per-connection unique ID. |
 | `IBKR_ACCOUNT` | `""` | DUxxxxxx (paper) or Uxxxxxxx (live) account number. |
+
+---
+
+## Broker — Alpaca
+
+Used only when `BROKER=alpaca`. Generate paper keys at
+<https://app.alpaca.markets/paper/dashboard/overview>. See
+`docs/BROKER_SETUP.md` § Path A for the full walk-through.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALPACA_API_KEY` | `""` | Paper account Key ID (`APCA-API-KEY-ID` header on every REST call). Required when `BROKER=alpaca`. |
+| `ALPACA_API_SECRET` | `""` | Paper account Secret Key (`APCA-API-SECRET-KEY` header). Stored as `SecretStr`; never logged. Required when `BROKER=alpaca`. |
+| `ALPACA_BASE_URL` | `https://paper-api.alpaca.markets` | REST base for orders/account/positions. Pinned to the paper host; do not point at `api.alpaca.markets`. |
+| `ALPACA_DATA_URL` | `https://data.alpaca.markets` | Market-data base used by `get_last_price()`. |
+| `ALPACA_STREAM_URL` | `wss://paper-api.alpaca.markets/stream` | WebSocket for `subscribe_trade_updates()`. Auto-reconnects with backoff on disconnect. |
 
 ---
 
@@ -127,12 +165,15 @@ These variables were introduced in v2 (see `bedcrock-plan.md`).
 
 ### Mode↔port coupling (invariant 9)
 
-The config validator now refuses to start when `MODE` and `IBKR_PORT` disagree:
+The config validator refuses to start when `MODE` and `IBKR_PORT` disagree
+(when `BROKER=ibkr`):
 
 - `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`
 - `MODE=live` requires `IBKR_PORT ∈ {4001, 7496}`
 
 A mismatched pair raises a `ValueError` at import time — the bot will not run.
+When `BROKER=alpaca`, this check is skipped (the validator dispatches per broker
+per the §3 truth table above).
 
 ---
 

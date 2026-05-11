@@ -2,7 +2,7 @@
 
 Always-on backend that ingests politician trades, hedge fund filings, insider buys, and options flow; scores them with hard gates; computes an indicator/regime layer per ticker; and emits one-click bracket orders to a paper or live broker via Discord. Reasoning runs on Claude Code Routines that consume the data via a FastAPI read layer.
 
-**Status:** v0.3 — built for paper trading on Interactive Brokers. Same broker for paper and live (just different ports).
+**Status:** v0.4 — supports two brokers behind one `BrokerAdapter`: Interactive Brokers (paper + live) and Alpaca (paper only). Pick with `BROKER=ibkr|alpaca`.
 
 ## What this is
 
@@ -30,6 +30,8 @@ docker compose up
 #   python -m src.workers.bot_worker
 #   uvicorn src.api.main:app --host 0.0.0.0 --port 8080
 ```
+
+**Easiest paper setup:** set `BROKER=alpaca` and paste two API keys from <https://app.alpaca.markets/paper/dashboard/overview>. No Gateway, no ports, no daily logout. For live trading or any setup outside the US, use `BROKER=ibkr` (the default). Full walk-through in [`docs/BROKER_SETUP.md`](docs/BROKER_SETUP.md).
 
 For production deployment (VPS + systemd), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
@@ -64,7 +66,7 @@ bedcrock/
 │   │   └── heavy_movement.py  # v2 N1 — volume/52w/gap corroboration ingestor
 │   ├── indicators/            # OHLCV + indicator computation
 │   ├── scoring/               # scorer + hard gates (incl. v2 sector-correlation)
-│   ├── broker/                # ibkr adapter (paper + live, port-switched)
+│   ├── broker/                # BrokerAdapter contract + ibkr/alpaca impls
 │   ├── orders/                # bracket builder, live monitor
 │   ├── safety/                # v2 — startup reconciler (broker truth wins)
 │   ├── backtest/              # v2 N4 — mini-replay for scoring-rule changes

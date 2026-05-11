@@ -24,6 +24,7 @@ References:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -35,7 +36,10 @@ from src.broker.base import (
     BrokerError,
     BrokerOrder,
     BrokerOrderState,
+    BrokerPosition,
+    OpenOrder,
     OrderRejectedError,
+    TradeUpdate,
 )
 from src.config import settings
 from src.db.models import Action
@@ -321,6 +325,236 @@ class IBKRBroker(BrokerAdapter):
             submitted_at=datetime.now(UTC),
             raw={"perm_id": trade.order.permId},
         )
+
+    # ----- v4 BrokerAdapter contract extensions -----
+
+    _ORDER_TYPE_MAP = {
+        "LMT": "limit",
+        "STP": "stop",
+        "STP LMT": "stop_limit",
+        "TRAIL": "trailing_stop",
+        "MKT": "market",
+    }
+
+    async def iter_open_orders(self) -> AsyncIterator[OpenOrder]:
+        """Walk ``ib.openTrades()`` and yield each as an ``OpenOrder``."""
+        ib = await self._ensure()
+        for trade in ib.openTrades():
+            order = trade.order
+            contract = trade.contract
+            parent_id = getattr(order, "parentId", 0) or 0
+            order_type_raw = (getattr(order, "orderType", "") or "").upper()
+            order_type = self._ORDER_TYPE_MAP.get(order_type_raw, order_type_raw.lower())
+            side = Action.BUY if (getattr(order, "action", "") or "").upper() == "BUY" else Action.SELL
+            limit_price = (
+                Decimal(str(order.lmtPrice))
+                if getattr(order, "lmtPrice", None) not in (None, 0, 0.0)
+                else None
+            )
+            stop_price = (
+                Decimal(str(order.auxPrice))
+                if getattr(order, "auxPrice", None) not in (None, 0, 0.0)
+                else None
+            )
+            qty = getattr(order, "totalQuantity", 0) or 0
+            yield OpenOrder(
+                broker_order_id=str(order.orderId),
+                parent_order_id=str(parent_id) if parent_id else None,
+                ticker=getattr(contract, "symbol", "") or "",
+                side=side,
+                order_type=order_type,
+                quantity=Decimal(str(qty)),
+                limit_price=limit_price,
+                stop_price=stop_price,
+                tif=(getattr(order, "tif", "") or "").lower(),
+                raw={
+                    "order_id": order.orderId,
+                    "perm_id": getattr(order, "permId", None),
+                    "parent_id": parent_id,
+                    "order_type": order_type_raw,
+                },
+            )
+
+    async def iter_positions(self) -> AsyncIterator[BrokerPosition]:
+        """Walk ``ib.positions()`` and yield each as a ``BrokerPosition``.
+
+        Forces a fresh ``reqPositionsAsync`` refresh first so consumers
+        (notably the startup reconciler) never trust a stale cache. This is
+        an IBKR-specific quirk; the broker-agnostic reconciler used to do
+        this itself but no longer reaches into ``_ib`` directly.
+        """
+        ib = await self._ensure()
+        try:
+            await ib.reqPositionsAsync()
+        except Exception as e:
+            logger.warning("ibkr_req_positions_failed", error=str(e))
+        for pos in ib.positions():
+            if pos.position == 0:
+                continue
+            contract = pos.contract
+            yield BrokerPosition(
+                ticker=getattr(contract, "symbol", "") or "",
+                quantity=Decimal(str(pos.position)),
+                avg_entry_price=Decimal(str(pos.avgCost)),
+                market_value=None,
+                unrealized_pnl=None,
+                raw={
+                    "account": getattr(pos, "account", None),
+                    "con_id": getattr(contract, "conId", None),
+                },
+            )
+
+    async def repair_child_to_gtc(self, broker_order_id: str) -> str:
+        """Cancel a non-GTC child and re-submit with ``tif='GTC'``.
+
+        Extracted from ``src.safety.reconciler.audit_open_order_tifs`` so the
+        repair is callable per-order via the abstract contract. Returns the new
+        broker_order_id (string).
+        """
+        ib = await self._ensure()
+        target_trade: Trade | None = None
+        for trade in ib.openTrades():
+            if str(trade.order.orderId) == str(broker_order_id):
+                target_trade = trade
+                break
+        if target_trade is None:
+            raise BrokerError(f"Order {broker_order_id} not found among open trades")
+
+        order = target_trade.order
+        original_tif = order.tif
+        ib.cancelOrder(order)
+        order.tif = "GTC"
+        order.outsideRth = True
+        order.orderId = 0  # force IBKR to assign a new ID
+        new_trade = ib.placeOrder(target_trade.contract, order)
+        logger.info(
+            "ibkr_repair_child_to_gtc",
+            old_order_id=broker_order_id,
+            new_order_id=new_trade.order.orderId,
+            original_tif=original_tif,
+        )
+        return str(new_trade.order.orderId)
+
+    @staticmethod
+    def _status_to_event(status: str, filled: float, remaining: float) -> str | None:
+        """Map an ib_async order-status string to our event vocabulary.
+
+        Returns ``None`` for statuses we don't surface (e.g. ``ApiPending``).
+        """
+        s = (status or "").lower()
+        if s == "filled":
+            return "fill"
+        if s in ("submitted", "presubmitted") and filled > 0 and remaining > 0:
+            return "partial_fill"
+        if s in ("cancelled", "canceled"):
+            return "canceled"
+        if s == "inactive":
+            return "rejected"
+        if s in ("submitted", "presubmitted", "pendingsubmit"):
+            return "new"
+        return None
+
+    async def subscribe_trade_updates(  # type: ignore[override]
+        self,
+    ) -> AsyncIterator[TradeUpdate]:
+        """Bridge ``ib_async`` order/exec events into a ``TradeUpdate`` stream.
+
+        Both ``orderStatusEvent`` (status transitions) and ``execDetailsEvent``
+        (executions with avg price) feed an in-process ``asyncio.Queue``. The
+        generator drains the queue and yields ``TradeUpdate``s forever; on
+        cancellation it detaches the handlers and re-raises.
+        """
+        ib = await self._ensure()
+        queue: asyncio.Queue[TradeUpdate] = asyncio.Queue()
+
+        def _on_order_status(trade) -> None:  # noqa: ANN001
+            try:
+                order = trade.order
+                status_obj = getattr(trade, "orderStatus", None)
+                status = (status_obj.status if status_obj else "") or ""
+                filled = float(getattr(status_obj, "filled", 0) or 0)
+                remaining = float(getattr(status_obj, "remaining", 0) or 0)
+                event = self._status_to_event(status, filled, remaining)
+                if event is None:
+                    return
+                avg = getattr(status_obj, "avgFillPrice", None)
+                avg_dec = (
+                    Decimal(str(avg))
+                    if avg not in (None, 0, 0.0)
+                    else None
+                )
+                contract = getattr(trade, "contract", None)
+                ticker = getattr(contract, "symbol", "") or ""
+                update = TradeUpdate(
+                    event=event,
+                    broker_order_id=str(order.orderId),
+                    client_order_id=getattr(order, "orderRef", None) or None,
+                    ticker=ticker,
+                    filled_qty=Decimal(str(filled)),
+                    filled_avg_price=avg_dec,
+                    timestamp=datetime.now(UTC),
+                    raw={
+                        "source": "orderStatusEvent",
+                        "status": status,
+                        "parent_id": getattr(order, "parentId", 0),
+                    },
+                )
+                queue.put_nowait(update)
+            except Exception as e:
+                logger.warning("ibkr_order_status_bridge_failed", error=str(e))
+
+        def _on_exec_details(trade, fill) -> None:  # noqa: ANN001
+            try:
+                order = trade.order
+                execution = fill.execution
+                contract = getattr(fill, "contract", None) or getattr(trade, "contract", None)
+                ticker = getattr(contract, "symbol", "") or ""
+                shares = float(getattr(execution, "shares", 0) or 0)
+                avg = getattr(execution, "avgPrice", None) or getattr(
+                    execution, "price", None
+                )
+                avg_dec = Decimal(str(avg)) if avg not in (None, 0, 0.0) else None
+                status_obj = getattr(trade, "orderStatus", None)
+                remaining = float(getattr(status_obj, "remaining", 0) or 0)
+                event = "fill" if remaining <= 0 else "partial_fill"
+                update = TradeUpdate(
+                    event=event,
+                    broker_order_id=str(order.orderId),
+                    client_order_id=getattr(order, "orderRef", None) or None,
+                    ticker=ticker,
+                    filled_qty=Decimal(str(shares)),
+                    filled_avg_price=avg_dec,
+                    timestamp=datetime.now(UTC),
+                    raw={
+                        "source": "execDetailsEvent",
+                        "exec_id": getattr(execution, "execId", None),
+                        "parent_id": getattr(order, "parentId", 0),
+                    },
+                )
+                queue.put_nowait(update)
+            except Exception as e:
+                logger.warning("ibkr_exec_details_bridge_failed", error=str(e))
+
+        ib.orderStatusEvent += _on_order_status
+        ib.execDetailsEvent += _on_exec_details
+        logger.info("ibkr_trade_updates_subscribed")
+
+        try:
+            while True:
+                update = await queue.get()
+                yield update
+        except asyncio.CancelledError:
+            logger.info("ibkr_trade_updates_cancelled")
+            raise
+        finally:
+            try:
+                ib.orderStatusEvent -= _on_order_status
+            except Exception:
+                pass
+            try:
+                ib.execDetailsEvent -= _on_exec_details
+            except Exception:
+                pass
 
     async def aclose(self) -> None:
         await self.disconnect()

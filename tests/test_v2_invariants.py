@@ -256,6 +256,7 @@ async def test_signal_to_position_e2e_paper_dryrun(monkeypatch):
     fake_ib.openTrades = MagicMock(return_value=trades)
     ibkr_broker = IBKRBroker()
     ibkr_broker._ib = fake_ib
+    ibkr_broker._connected = True
     repaired = await audit_open_order_tifs(ibkr_broker)
     assert repaired == []
 
@@ -397,6 +398,7 @@ async def test_reconciler_audits_ALL_open_orders():
 
     broker = IBKRBroker()
     broker._ib = fake_ib
+    broker._connected = True
 
     with patch("src.safety.reconciler.post_system_health", new=AsyncMock()):
         repaired = await audit_open_order_tifs(broker)

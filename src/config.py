@@ -16,6 +16,11 @@ class Mode(str, Enum):
     LIVE = "live"
 
 
+class Broker(str, Enum):
+    IBKR = "ibkr"
+    ALPACA = "alpaca"
+
+
 class LogFormat(str, Enum):
     JSON = "json"
     TEXT = "text"
@@ -37,6 +42,9 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "postgresql+asyncpg://bedcrock:bedcrock@localhost:5432/bedcrock"
 
+    # --- Broker selection ---
+    broker: Broker = Broker.IBKR
+
     # --- Broker (IBKR) ---
     # Paper: port 4002 (Gateway) or 7497 (TWS)
     # Live:  port 4001 (Gateway) or 7496 (TWS)
@@ -44,6 +52,14 @@ class Settings(BaseSettings):
     ibkr_port: int = 4002
     ibkr_client_id: int = 1
     ibkr_account: str = ""
+
+    # --- Broker (Alpaca) ---
+    # Paper-only; live is US-only and refused at boot (Canada).
+    alpaca_api_key: SecretStr | None = None
+    alpaca_api_secret: SecretStr | None = None
+    alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    alpaca_data_url: str = "https://data.alpaca.markets"
+    alpaca_stream_url: str = "wss://paper-api.alpaca.markets/stream"
 
     # --- Data sources ---
     quiver_api_key: SecretStr = SecretStr("")
@@ -104,21 +120,33 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL must use postgresql+asyncpg:// driver")
         return v
 
-    # v2 invariant 9: mode and IBKR port are coupled. Mismatched config
-    # (e.g. MODE=live with the paper port 4002) refuses to boot.
+    # v4: dispatch the boot-time invariant per broker. See V4_ALPACA_PLAN §3.
     @model_validator(mode="after")
-    def _validate_mode_port(self) -> "Settings":
-        valid_paper_ports = {4002, 7497}
-        valid_live_ports = {4001, 7496}
-        if self.mode == Mode.PAPER and self.ibkr_port not in valid_paper_ports:
+    def _validate_broker_mode(self) -> Settings:
+        if self.broker is Broker.IBKR:
+            valid_paper_ports = {4002, 7497}
+            valid_live_ports = {4001, 7496}
+            if self.mode == Mode.PAPER and self.ibkr_port not in valid_paper_ports:
+                raise ValueError(
+                    f"MODE=paper requires IBKR_PORT in {sorted(valid_paper_ports)}, "
+                    f"got {self.ibkr_port}. 4002 is IB Gateway paper, 7497 is TWS paper."
+                )
+            if self.mode == Mode.LIVE and self.ibkr_port not in valid_live_ports:
+                raise ValueError(
+                    f"MODE=live requires IBKR_PORT in {sorted(valid_live_ports)}, "
+                    f"got {self.ibkr_port}. 4001 is IB Gateway live, 7496 is TWS live."
+                )
+            return self
+
+        # Alpaca branch
+        if self.mode == Mode.LIVE:
             raise ValueError(
-                f"MODE=paper requires IBKR_PORT in {sorted(valid_paper_ports)}, "
-                f"got {self.ibkr_port}. 4002 is IB Gateway paper, 7497 is TWS paper."
+                "Alpaca live brokerage is US-only; use BROKER=ibkr for live in Canada."
             )
-        if self.mode == Mode.LIVE and self.ibkr_port not in valid_live_ports:
+        # Paper: require credentials. IBKR_* fields are intentionally ignored.
+        if self.alpaca_api_key is None or self.alpaca_api_secret is None:
             raise ValueError(
-                f"MODE=live requires IBKR_PORT in {sorted(valid_live_ports)}, "
-                f"got {self.ibkr_port}. 4001 is IB Gateway live, 7496 is TWS live."
+                "BROKER=alpaca requires ALPACA_API_KEY and ALPACA_API_SECRET to be set."
             )
         return self
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 
 from src.broker import make_broker
-from src.broker.ibkr import IBKRBroker
 from src.db.session import SessionLocal, dispose
 from src.logging_config import configure_logging, get_logger
 from src.orders.monitor import LiveMonitor
@@ -28,14 +27,17 @@ TIF_AUDIT_INTERVAL_SEC = 30
 
 
 async def _tif_audit_loop(monitor: LiveMonitor) -> None:
-    """Periodically re-issue any bracket child whose TIF drifted off GTC."""
+    """Periodically re-issue any bracket child whose TIF drifted off GTC.
+
+    Broker-agnostic — ``audit_open_order_tifs`` swallows broker-unavailable
+    states internally (it just yields no orders), so the worker has no need
+    to peek at adapter internals.
+    """
     while not monitor._stopped:
         try:
-            broker = monitor._broker
-            if isinstance(broker, IBKRBroker) and broker._ib.isConnected():
-                repaired = await audit_open_order_tifs(broker)
-                if repaired:
-                    logger.warning("tif_audit_repaired_orders", count=len(repaired))
+            repaired = await audit_open_order_tifs(monitor._broker)
+            if repaired:
+                logger.warning("tif_audit_repaired_orders", count=len(repaired))
         except Exception as e:
             logger.warning("tif_audit_loop_failed", error=str(e))
         await asyncio.sleep(TIF_AUDIT_INTERVAL_SEC)

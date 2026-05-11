@@ -244,7 +244,7 @@ def test_reconcile_orphan_alert():
 
     audit_entries = [a for a in db.added if isinstance(a, AuditLog)]
     assert any(
-        a.action == "orphan_ibkr_detected" and a.target_id == "AAPL"
+        a.action == "orphan_broker_detected" and a.target_id == "AAPL"
         for a in audit_entries
     )
     mock_alert.assert_awaited()

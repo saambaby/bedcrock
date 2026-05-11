@@ -354,3 +354,60 @@ of truth.
 
 For the v0.3.0 architecture rationale and the per-wave plan, see Appendix C in
 `bedcrock-plan.md` and the `v3-staging` branch history.
+
+---
+
+## v4 status (2026-05-11)
+
+v0.4.0 added Alpaca as a second broker behind `BrokerAdapter`. IBKR remains the
+only live path (Alpaca brokerage is US-only). Plan: `docs/V4_ALPACA_PLAN.md`.
+Four parallel waves landed on `v4-staging` before squash-merge to `main`.
+
+### `src/broker/alpaca.py` — Alpaca paper adapter
+
+**Solid.** Raw `httpx` + `websockets` (no `alpaca-py`) keeps the dep surface
+small and the transport debuggable. REST hits `paper-api.alpaca.markets` only;
+the base URL is pinned in config so a stray key can't be aimed at the live
+endpoint. `submit_bracket` passes `client_order_id` for idempotency and treats
+`422 code=40010001` ("client_order_id already exists") as success by fetching
+the existing order. `tenacity.AsyncRetrying` with `wait_random_exponential` (3
+attempts, max 10s, treats `429`/5xx as retriable) absorbs Alpaca paper's
+200 req/min cap. **Gap.** Equities only — no crypto, no options; matches
+current scope. **Watch.** Alpaca occasionally returns DAY-TIF children on
+bracket submit even when the parent is GTC; the adapter verifies and self-
+repairs but the reason for the inconsistency is not documented upstream.
+
+### `src/broker/base.py` — contract extension
+
+**Solid.** Adds `iter_open_orders()`, `iter_positions()`, `repair_child_to_gtc()`,
+and `subscribe_trade_updates()` as the only new surfaces. `OpenOrder`,
+`BrokerPosition`, `TradeUpdate` dataclasses carry a `raw: dict` field so
+broker-specific shape stays inspectable without bloating the typed contract.
+Default `subscribe_trade_updates` raises `NotImplementedError`; both adapters
+override. **Gap.** No abstract method for partial-fill aggregation — Position
+rows still record full quantity at entry fill (carried over from v0.1). Logged
+as deferred.
+
+### `src/safety/reconciler.py` — broker-agnostic refactor
+
+**Solid.** `audit_open_order_tifs(broker: BrokerAdapter)` walks
+`broker.iter_open_orders()` and calls `broker.repair_child_to_gtc()` on any
+child found with `tif != "gtc"`. `reconcile_against_broker` uses
+`broker.iter_positions()` for orphan detection. No `_ib` access remains
+outside `src/broker/ibkr.py`; `grep -r "broker\._ib" src/` returns zero
+matches outside that file. Existing tests pass against `IBKRBroker`; the same
+suite runs against `AlpacaBroker` VCR cassettes for parity. **Gap.** The
+audit-log `event` field is now stringly-typed across two brokers; a dedicated
+column for `broker` would be cleaner but is migration cost we punted.
+
+### `src/orders/monitor.py` — trade-updates loop
+
+**Solid.** Main loop is now `async for update in broker.subscribe_trade_updates()`,
+broker-agnostic. The 30s polling fallback survives and reads
+`broker.iter_open_orders()`. IBKR's `subscribe_trade_updates` bridges
+`ib.execDetailsEvent` + `ib.orderStatusEvent` into an `asyncio.Queue`; Alpaca's
+opens the WS, authenticates with the secret, subscribes to `trade_updates`,
+and yields. Both reconnect on disconnect with exponential backoff and the
+polling loop covers any window in between. **Gap.** The Alpaca WebSocket free
+tier rate-limits aggressive reconnects; persistent flapping will surface as
+`alpaca_stream_reconnect` log noise — alertable, not a correctness issue.
