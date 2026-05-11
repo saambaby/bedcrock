@@ -2,7 +2,8 @@
 
 The system is designed to run on a small VPS (1–2 vCPU, 2 GB RAM is plenty).
 Postgres and four Python workers run there. Your laptop does not need to be
-on for the system to work.
+on for the system to work. The reasoning layer (Claude Code Routines) runs
+cloud-side on Anthropic infrastructure — not on the VPS.
 
 ## Reference architecture
 
@@ -18,16 +19,17 @@ on for the system to work.
     │   │ ct-ingest       │ ←── data sources (HTTP)
     │   │ ct-monitor      │ ←── broker (WebSocket)
     │   │ ct-bot          │ ←── Discord bot gateway
-    │   │ ct-api          │ ←── FastAPI :8080
+    │   │ ct-api          │ ←── FastAPI :8080 (bearer-auth read layer)
     │   └─────────────────┘         │
-    │   ┌─────────────────┐         │
-    │   │ Syncthing       │ ── sync vault folder ──→ laptop / phone
-    │   └─────────────────┘         │
-    └───────────────────────────────┘
+    └───────────────┬───────────────┘
                     │
-                Discord (webhooks + bot gateway)
-                    │
-                    └─── you (mobile)
+        ┌───────────┴────────────┐
+        │                        │
+   Discord (webhooks       Claude Code Routines
+   + bot gateway)          (cloud-hosted, call the
+        │                  FastAPI read layer over
+        │                  HTTPS with a bearer token)
+        └─── you (mobile)
 ```
 
 ## VPS setup
@@ -79,19 +81,14 @@ pip install -e .
 cp .env.example .env
 # Edit .env — every key documented inline. Required:
 #   DATABASE_URL  (must use postgresql+asyncpg://)
-#   VAULT_PATH    (absolute path; we'll create it next)
 #   IBKR_ACCOUNT (your IBKR paper/live account ID)
 #   QUIVER_API_KEY  UNUSUAL_WHALES_API_KEY  FINNHUB_API_KEY
 #   SEC_USER_AGENT (your name + email — required by SEC)
 #   DISCORD_WEBHOOK_*  DISCORD_BOT_TOKEN  DISCORD_GUILD_ID
 #   API_SIGNING_SECRET (generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))')
-```
-
-Create the vault directory:
-
-```bash
-mkdir -p /home/bedcrock/vault/Trading
-cp -r vault-templates/* /home/bedcrock/vault/Trading/
+#   API_BEARER_TOKEN   (same generator — used by Claude Code Routines to auth
+#                       to the FastAPI read layer; falls back to API_SIGNING_SECRET
+#                       if unset)
 ```
 
 ### 6. Database migration
@@ -104,7 +101,7 @@ alembic upgrade head
 
 ```bash
 # Verify config loads + DB reachable
-python -c "from src.config import settings; print(settings.mode, settings.vault_path)"
+python -c "from src.config import settings; print(settings.mode)"
 
 # Run one manual ingest pass
 python -c "import asyncio; from src.workers.ingest_worker import run_ingestors; asyncio.run(run_ingestors())"
@@ -131,25 +128,72 @@ journalctl -u ct-ingest -f
 journalctl -u ct-monitor -f
 ```
 
-## Syncthing — vault to laptop
+## Reasoning layer setup (Claude Code Routines)
 
-On the VPS:
+The five skills in `.claude/skills/` are the reasoning surface of Bedcrock.
+They run as **cloud-hosted Claude Code Routines** on Anthropic
+infrastructure — not on the VPS — and consume your Claude Pro/Max
+subscription, not an API key. The VPS only needs to expose the FastAPI read
+layer (port 8080) over HTTPS with a bearer token.
+
+### 1. Install Claude Code locally
+
+On any development machine (your laptop is fine — it does not need to be
+running for the Routines to fire), install Claude Code and clone the repo:
 
 ```bash
-sudo apt install -y syncthing
-sudo systemctl enable --now syncthing@bedcrock
-# Tunnel port 8384 to your laptop to reach the Web UI:
-ssh -L 8384:localhost:8384 bedcrock@vps
-# Then open http://localhost:8384
+# Install per https://docs.anthropic.com/claude-code
+git clone <your-repo> ~/code/bedcrock
+cd ~/code/bedcrock
+claude
 ```
 
-Add `/home/bedcrock/vault/Trading/` as a shared folder. On your laptop,
-install Syncthing and accept the share. Point Obsidian at the synced
-folder. The Cowork desktop app can read directly from the same folder.
+The `.claude/skills/` directory in the repo is auto-discovered. Verify with
+`/skills` inside the session.
 
-**Conflict policy:** Syncthing will create `<file>.sync-conflict-...` if
-both sides edit the same file. The backend only writes to `00 Inbox/`;
-Cowork only writes outside the inbox. The conflict surface is small.
+### 2. Schedule each skill as a Routine
+
+From inside the `claude` session, register one Routine per skill via
+`/schedule`. Times are in ET; adjust the cron expressions if you live in a
+different zone:
+
+```
+/schedule "every weekday at 06:30 ET, run /morning-analyze"
+/schedule "every weekday at 12:00 ET, run /intraday-check"
+/schedule "every weekday at 14:00 ET, run /intraday-check"
+/schedule "every weekday hourly from 10:00 to 16:00 ET, run /hourly-closure"
+/schedule "every Sunday at 19:00 ET, run /weekly-synthesis"
+```
+
+The `status` skill is on-demand only — no schedule.
+
+### 3. Set Routine environment variables
+
+Routine secrets are managed in the Claude Code dashboard at
+[claude.ai/code/routines](https://claude.ai/code/routines), not in the repo.
+Set the following on each Routine:
+
+| Variable | Value |
+|---|---|
+| `API_BASE_URL` | Public HTTPS URL of the FastAPI deployment, e.g. `https://api.bedcrock.example.com` |
+| `API_BEARER_TOKEN` | Must match `settings.api_bearer_token` on the server (or `api_signing_secret` if the bearer token is unset — the server falls back) |
+| `DISCORD_WEBHOOK_HIGH_SCORE` | Webhook for morning/intraday plan embeds |
+| `DISCORD_WEBHOOK_POSITIONS` | Webhook for hourly closure decisions |
+| `DISCORD_WEBHOOK_SYSTEM_HEALTH` | Webhook for skill failures and weekly synthesis |
+
+### 4. Verify
+
+Before turning the schedules loose, run each skill interactively at least
+once:
+
+```
+/morning-analyze
+```
+
+A successful run posts a single embed to `$DISCORD_WEBHOOK_HIGH_SCORE`. A
+failure posts an error to `$DISCORD_WEBHOOK_SYSTEM_HEALTH`. If neither shows
+up, check that `API_BASE_URL` is reachable from the public internet and that
+the bearer token round-trips against `/healthz`.
 
 ## Updating
 
@@ -165,17 +209,18 @@ exit
 sudo systemctl start ct-ingest ct-monitor ct-bot ct-api
 ```
 
+Skill changes (anything under `.claude/skills/`) are picked up by Routines
+on next invocation — no server restart needed, since Routines pull skill
+definitions from your repo.
+
 ## Backup
 
-The vault is the source of truth — Syncthing already gives you 2 copies
-(VPS + laptop). For DB backup:
+Postgres is the canonical store. Daily dump:
 
 ```bash
 # Daily cron on the VPS:
 0 4 * * * sudo -u postgres pg_dump bedcrock | gzip > /backups/bedcrock-$(date +%F).sql.gz
 ```
-
-The DB can be rebuilt from the vault if needed (rehydrate worker — TODO v0.2).
 
 ## IB Gateway operational notes
 
@@ -195,5 +240,6 @@ IB Gateway is not designed to be a 24/7 daemon. Running it reliably as a service
 - **No Discord posts:** verify webhooks via `curl -X POST -H 'Content-Type: application/json' -d '{"content":"test"}' <webhook_url>`.
 - **Drafts never confirm:** check `ct-bot` is running and the bot is in your
   guild. `/heartbeat` slash command is the simplest probe.
-- **Vault not syncing:** Syncthing Web UI shows per-folder sync status. The
-  most common issue is a `.stignore` mistakenly matching `.md`.
+- **Routine ran but nothing posted:** check the Routine run log at
+  claude.ai/code/routines. Most common: `API_BASE_URL` not reachable from
+  the public internet, or `API_BEARER_TOKEN` mismatch with the server.
