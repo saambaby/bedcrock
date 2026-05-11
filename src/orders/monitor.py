@@ -2,7 +2,7 @@
 
 Subscribes to IBKR's order/trade events via ib_async and translates fills into:
   - Position rows (on entry fills)
-  - Closure inbox events (on stop/target fills) — for Cowork's hourly run
+  - Position closure rows (on stop/target fills) — read by the hourly-closure skill
   - Discord #position-alerts pings
 
 Stops and targets live SERVER-SIDE at the broker as bracket orders. This monitor

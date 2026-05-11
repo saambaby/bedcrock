@@ -2,7 +2,7 @@
 
 Schedules each ingestor at its native cadence (settings.ingest_interval_*),
 runs the scorer + gates on every new signal, builds drafts for high-score
-non-blocked signals, writes everything to the vault, and pings Discord.
+non-blocked signals, persists everything to Postgres, and pings Discord.
 
 Runs forever. Crash-safe — each tick is atomic at the DB level.
 """

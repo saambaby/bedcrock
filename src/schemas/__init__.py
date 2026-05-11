@@ -1,8 +1,8 @@
 """Pydantic schemas — the wire format between modules.
 
 These are *not* the DB models. DB models live in src/db/models.py.
-Schemas are used for: ingestor outputs, scorer inputs, vault frontmatter,
-Discord embeds, and FastAPI request/response.
+Schemas are used for: ingestor outputs, scorer inputs, Discord embeds,
+and FastAPI request/response.
 """
 
 from __future__ import annotations
