@@ -1,12 +1,12 @@
 ---
 title: Bedcrock — Build & Migration Plan
 status: active
-version: v3
+version: v4
 phase: paper-1
 created: 2026-05-03
-updated: 2026-05-10
-implemented: 2026-05-10
-shipped_as: v0.3.0
+updated: 2026-05-11
+implemented: 2026-05-11
+shipped_as: v0.4.0
 tags: [trading/system, plan]
 ---
 
@@ -18,7 +18,7 @@ A signal-aggregation and analysis system that watches politicians, hedge fund ti
 > This is a personal research/decision-support system. It is not a registered advisory service. Do not let other people's money ride on it without consulting a securities lawyer in your jurisdiction.
 
 > [!info] Document version
-> This is the canonical, self-contained spec. It folds in everything that landed in v0.3.0 (drop the Obsidian vault and Cowork prompts; reasoning moves to Claude Code skills + cloud-hosted Routines). For the full evolution from v0.1 → v0.2 → v0.3, see Appendix C — Version history.
+> This is the canonical, self-contained spec. It folds in everything that landed through v0.4.0 (drop the Obsidian vault and Cowork prompts in v0.3; add the Alpaca paper broker behind a generic `BrokerAdapter` in v0.4). For the full evolution from v0.1 → v0.2 → v0.3 → v0.4, see Appendix C — Version history.
 
 ---
 
@@ -41,15 +41,15 @@ A signal-aggregation and analysis system that watches politicians, hedge fund ti
 
 These are the invariants. Every component has to respect them or migration breaks.
 
-1. **Paper and live share one data path.** The only difference between paper and live is the broker endpoint and a `mode: paper|live` flag. Everything else — DB schemas, Discord channels, Claude Code skills, scoring — is identical.
-2. **Three-layer authority.** The broker (IBKR) is the source of truth for live positions and open orders — it survives bot/VPS/network death. The DB (Postgres) is operational truth for everything else: signals, drafts, indicators, audit log, daily state, scoring proposals, replay reports. The Claude Code reasoning layer consumes the DB via a FastAPI read layer; it does not have its own persistence. On conflict between layers, broker beats DB beats reasoning.
+1. **Paper and live share one data path.** Paper and live differ only by the `mode: paper|live` flag and which `BrokerAdapter` is selected by `BROKER=ibkr|alpaca`. Everything else — DB schemas, Discord channels, Claude Code skills, scoring — is identical. Live remains IBKR-only (Alpaca brokerage is US-only and the operator is in Canada); Alpaca is the easy-setup paper path.
+2. **Three-layer authority.** The active broker is the source of truth for live positions and open orders — it survives bot/VPS/network death. The DB (Postgres) is operational truth for everything else: signals, drafts, indicators, audit log, daily state, scoring proposals, replay reports. The Claude Code reasoning layer consumes the DB via a FastAPI read layer; it does not have its own persistence. On conflict between layers, broker beats DB beats reasoning.
 3. **DB is the only durable store.** Claude Code Routines (cloud-hosted, scheduled) read from FastAPI read endpoints, reason, and write back through dedicated POST endpoints (e.g. `/scoring-proposals`). There is no file-based IPC bus.
 4. **Reasoning is stateless and replayable.** Routines hold no state between runs; every run starts from a fresh dashboard fetch. Re-running a skill on the same DB snapshot produces the same conclusions modulo Claude's sampling.
 5. **Every decision leaves a trace.** Every entry, exit, and skipped signal gets a note. Without traces, the weekly synthesis has nothing to learn from.
 6. **Humans confirm entries; machines manage exits.** Bot prepares the bracket order with stop and target attached; you click once to send it. Once filled, server-side OCO at the broker manages the exit even if your VPS dies. This split is intentional: humans are good at sanity-checking but bad at obeying stops, machines are the opposite.
-7. **Broker truth wins on conflict.** On any startup or post-disconnect reconnect, IBKR's view of positions and open orders is the source of truth; the DB is repaired to match (with an audit-log entry per repair). Orphan positions in IBKR with no DB record raise an alert; DB rows the broker has no record of are marked closed-externally.
-8. **Stops are GTC by construction.** No code path may submit a child order with `tif != "GTC"`. A reconciler audit re-issues any non-conforming order found on the wire. Bracket parents are DAY (entry-zone-as-daily-decision); bracket children (stop and take-profit) are GTC + `outsideRth=True` so overnight gaps and pre/post-market action are protected.
-9. **Mode and port are coupled.** `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}` (4002 = IB Gateway paper, 7497 = TWS paper). `MODE=live` requires `{4001, 7496}`. Mismatched config refuses to boot. Prevents the "shipped paper code to the live port" disaster.
+7. **Broker truth wins on conflict.** On any startup or post-disconnect reconnect, the active broker's view of positions and open orders is the source of truth; the DB is repaired to match (with a broker-tagged audit-log entry per repair). Orphan positions the broker has but the DB doesn't raise an alert; DB rows the broker has no record of are marked closed-externally. Implemented via the broker-agnostic `iter_open_orders()` / `iter_positions()` contract on `BrokerAdapter`.
+8. **Stops are GTC by construction.** No code path may submit a child order with `tif != "GTC"`. Two-layer safety net: every adapter verifies child legs immediately after `submit_bracket` and self-repairs via `repair_child_to_gtc()` (Alpaca brackets in particular can return child stops as DAY-tif); the reconciler then audits any drift found on the wire. Bracket parents are DAY (entry-zone-as-daily-decision); bracket children (stop and take-profit) are GTC, with IBKR additionally setting `outsideRth=True` so overnight gaps and pre/post-market action are protected.
+9. **Broker and mode are coupled at boot.** A per-broker validator in `src/config.py` enforces the truth table: `BROKER=ibkr` requires `IBKR_PORT ∈ {4002, 7497}` for paper and `{4001, 7496}` for live; `BROKER=alpaca` requires `ALPACA_API_KEY` + `ALPACA_API_SECRET` for paper and refuses live entirely ("Alpaca live brokerage is US-only; use BROKER=ibkr for live in Canada."). Mismatched config refuses to boot. Prevents the "shipped paper code to the live port" disaster and the "tried to use Alpaca for live trading" misconfiguration.
 
 ---
 
@@ -71,7 +71,7 @@ flowchart LR
         B1[Ingestors]
         B2[Scorer + Gates<br/>liquidity, earnings,<br/>correlation, regime]
         B3[Live Monitor<br/>price + position]
-        B4[IBKR Adapter<br/>Paper / Live]
+        B4[Broker Adapter<br/>IBKR paper+live · Alpaca paper]
         B5[Indicator<br/>Computer]
         B6[Reconciler<br/>broker truth wins]
     end
@@ -221,9 +221,10 @@ Pick the cheapest set that covers two faster channels and one slower channel for
 - `pydantic` for the signal schema and settings
 - `discord.py` + `discord-webhook` for posts and slash commands
 - **`ib_async==2.1.0`** for the IBKR adapter (paper and live, same code path) — pure-asyncio, actively maintained successor to the abandoned `ib_insync`
+- **`httpx` + `websockets`** for the Alpaca adapter (paper only, raw REST + the `trade_updates` WebSocket; no `alpaca-py` so the dependency surface stays small and the transport is debuggable)
 - `pandas` + `pandas-ta` for indicator computation (Wilder ATR, RSI)
 - `pg_dump` cron job for nightly Postgres backup to a private object store
-- **IBC** (https://github.com/IbcAlpha/IBC) + Xvfb in a `gnzsnz/ib-gateway-docker`-style container for IB Gateway lifecycle. IBKR forces a logout window 23:45–00:45 ET nightly and again Sunday for re-auth; IBC handles auto-relogin. Configure `AutoRestartTime=23:45` (time-based, not token-based — token AutoRestart is broken on unfunded paper accounts per IBC issue #345). The `LiveMonitor` tolerates a ~5-min disconnect without paging. `IBKRBroker.connect()` retries with exponential backoff (5 attempts: 1s, 2s, 4s, 8s, 16s) and posts a system-health alert on terminal failure.
+- **IBC** (https://github.com/IbcAlpha/IBC) + Xvfb in a `gnzsnz/ib-gateway-docker`-style container for IB Gateway lifecycle (only when `BROKER=ibkr`; Alpaca is keyless setup, no Gateway). IBKR forces a logout window 23:45–00:45 ET nightly and again Sunday for re-auth; IBC handles auto-relogin. Configure `AutoRestartTime=23:45` (time-based, not token-based — token AutoRestart is broken on unfunded paper accounts per IBC issue #345). The `LiveMonitor` tolerates a ~5-min disconnect without paging. `IBKRBroker.connect()` retries with exponential backoff (5 attempts: 1s, 2s, 4s, 8s, 16s) and posts a system-health alert on terminal failure. The Alpaca WS stream is a self-reconnecting generator with capped exponential backoff; the 30s polling fallback in the monitor covers any window between disconnect and reconnect.
 
 **Responsibilities:**
 - Poll each data source at its appropriate cadence (Form 4: every 15 min during market hours; 13F: daily; politician trades: every 30 min; options flow: websocket; earnings calendar: daily at 06:00 ET; OHLCV: end-of-day + on-demand; heavy-movement: every 5 min during market hours).
@@ -234,7 +235,7 @@ Pick the cheapest set that covers two faster channels and one slower channel for
 - Post to Discord webhooks.
 - Run the live monitor (price subscriptions for currently-open positions in the DB).
 - Prepare bracket orders for one-click confirmation (see §5.9).
-- Talk to IBKR for paper or live fills and position state, depending on `MODE` and `IBKR_PORT`.
+- Talk to the active broker for fills and position state. `make_broker()` in `src/broker/__init__.py` dispatches on `BROKER`: IBKR for paper (`IBKR_PORT ∈ {4002, 7497}`) or live (`{4001, 7496}`); Alpaca for paper only. Everything downstream of the adapter reads through the `BrokerAdapter` contract and never imports a concrete adapter class.
 
 ### 5.3 Reasoning Surface
 
@@ -348,11 +349,11 @@ Caveats baked into the module: historical OHLCV only (no bid/ask depth), constan
 
 A long-running Python process on the VPS:
 
-- Subscribes to IBKR's `orderStatusEvent` and `execDetailsEvent` for instant fill notifications. Polling fallback every 30s catches missed events.
+- Subscribes to the active broker's trade-updates stream via the broker-agnostic `BrokerAdapter.subscribe_trade_updates()` generator. For IBKR it bridges `orderStatusEvent` + `execDetailsEvent` into an asyncio queue; for Alpaca it opens `wss://paper-api.alpaca.markets/stream`, authenticates, listens on `trade_updates`, and reconnects with capped exponential backoff on drop. The monitor loop is one `async for update in broker.subscribe_trade_updates(): await _handle_update(update)`. Polling fallback every 30s catches missed events.
 - **Stops and targets are server-side at the broker as OCO bracket orders, not enforced by this monitor.** The monitor *observes*; the broker *enforces*. If your VPS dies overnight, your stops still fire (because they're GTC by construction — see invariant 8).
-- **Idempotency by construction.** `_on_entry_fill` first checks `SELECT Position WHERE broker_order_id = ?`; if a row already exists (because the WS handler beat the polling reconciler, or vice versa), it logs and returns instead of inserting a duplicate. Defense in depth: `Position.broker_order_id` has a `UNIQUE` constraint at the DB layer, so a second insert would error rather than corrupt.
-- **Startup reconciliation against IBKR (invariant 7).** On `LiveMonitor.start()`, after broker connect and before the event loop begins, runs `_reconcile_against_broker`: any IBKR position not in the DB raises an `orphan_ibkr_position` alert and an `AuditLog` row; any open DB position the broker has no record of is marked `status=CLOSED, close_reason=EXTERNAL`. This catches the "worker crashed between `placeOrder` and writing the Position row" failure mode and the "user closed via mobile app" case.
-- **Reconciler audit (invariant 8).** Every 30s, walks `ib.openTrades()` and re-issues any child order with `tif != "GTC"` as GTC + `outsideRth=True`. Posts a `#system-health` alert per repair.
+- **Idempotency by construction.** `_handle_update` first checks `SELECT Position WHERE broker_order_id = ?`; if a row already exists (because the WS handler beat the polling reconciler, or vice versa), it logs and returns instead of inserting a duplicate. Defense in depth: `Position.broker_order_id` has a `UNIQUE` constraint at the DB layer, so a second insert would error rather than corrupt.
+- **Startup reconciliation against the broker (invariant 7).** On `LiveMonitor.start()`, after broker connect and before the event loop begins, runs `_reconcile_against_broker` over `broker.iter_positions()` and `broker.iter_open_orders()`: any broker position not in the DB raises an `orphan_broker_detected` alert and a broker-tagged `AuditLog` row; any open DB position the broker has no record of is marked `status=CLOSED, close_reason=EXTERNAL`. This catches the "worker crashed between `submit_bracket` and writing the Position row" failure mode and the "user closed via mobile app" case.
+- **Reconciler audit (invariant 8).** Every 30s, walks `broker.iter_open_orders()` and re-issues any child with `tif != "GTC"` via `broker.repair_child_to_gtc()`. Posts a `#system-health` alert per repair, tagged with the broker. (Alpaca's adapter also performs this check at submit time, since Alpaca bracket children can return as DAY-tif; the reconciler is the wire-level safety net.)
 - On every tick, updates the position row with the current price and unrealized P&L (so the dashboard endpoints are always live).
 - On stop or target fill received from broker, writes a closure event row, transitions the position to `status=CLOSED`, and posts to `#position-alerts`. The next `hourly-closure` Routine picks up the closure row and writes the post-mortem.
 - Re-queries the open positions list every 30 seconds so newly-opened positions get monitored automatically.
@@ -464,30 +465,44 @@ The execution layer is deliberately split so the human is the trigger, but never
 
 ### 6.1 Broker
 
-**Same broker for paper and live: Interactive Brokers.** Paper and live are differentiated by `IBKR_PORT` only (`4002` IB Gateway paper / `7497` TWS paper / `4001` IB Gateway live / `7496` TWS live), validated by the mode↔port coupling (invariant 9). This collapses the entire migration story to two env-var changes (`MODE` and `IBKR_PORT`).
+**Two adapters behind one contract: IBKR (paper + live) and Alpaca (paper only).** Selected at boot by `BROKER=ibkr|alpaca`; live remains IBKR-only because Alpaca brokerage is US-only and the operator is in Canada. Both adapters implement `BrokerAdapter` (`src/broker/base.py`); the rest of the system (scorer, monitor, reconciler, workers) talks to the contract and never imports a concrete class. `make_broker()` in `src/broker/__init__.py` is the only dispatch site.
 
-Why IBKR over Alpaca/Tradier (the v1 candidates):
+**Truth table** (invariant 9, enforced at boot):
+
+| `BROKER` | `MODE=paper` | `MODE=live` |
+|---|---|---|
+| `ibkr` (default) | OK if `IBKR_PORT ∈ {4002, 7497}` | OK if `IBKR_PORT ∈ {4001, 7496}` |
+| `alpaca` | OK if `ALPACA_API_KEY` + `ALPACA_API_SECRET` set | **Refused** ("Alpaca live brokerage is US-only; use BROKER=ibkr for live in Canada") |
+
+**Why IBKR for the live path** (the v1 candidates were Alpaca and Tradier):
 - Best execution at any meaningful book size; cheapest at scale; international markets if ever needed.
 - Mature paper environment that mirrors live behavior closely.
 - Native bracket orders with server-side OCO.
 - The cost is the API: `ib_async` (the maintained successor to `ib_insync`) is good but IB Gateway has a desktop-app heritage that needs IBC + Xvfb to run headless. See §5.2 for the deployment recipe.
 
+**Why Alpaca as the secondary paper path** (added in v0.4.0):
+- Setup is two API keys and zero infrastructure — no Gateway, no Xvfb, no nightly relogin window. Useful when validating a config change or running a one-off paper experiment without standing up IBC.
+- Native bracket orders via `POST /v2/orders` with `order_class=bracket` (server-side OCO, same semantics as IBKR).
+- `wss://paper-api.alpaca.markets/stream` carries `trade_updates`, so the monitor stays push-based.
+- The gotcha: Alpaca bracket child stops can return with `time_in_force=day` even when the parent is DAY. The adapter verifies every child immediately after `submit_bracket` and self-repairs via `repair_child_to_gtc()`; the reconciler audits drift on the wire. This is the Alpaca-side enforcement of invariant 8.
+- Implemented with raw `httpx` + `websockets` rather than `alpaca-py` to keep the dependency surface small and the transport debuggable; six REST endpoints plus the WS stream is enough.
+
 ### 6.2 Order Mechanics
 
-Every entry is a **bracket order**: limit entry + OCO (one-cancels-other) stop loss + take profit. Sent in a single API call (three orders with shared `parentId`, atomic at IBKR). Children are GTC + `outsideRth=True` (invariant 8); parent is DAY.
+Every entry is a **bracket order**: limit entry + OCO (one-cancels-other) stop loss + take profit. Submitted via a single `BrokerAdapter.submit_bracket(spec)` call — IBKR sends three orders with a shared `parentId`; Alpaca sends one `POST /v2/orders` with `order_class=bracket` and nested `take_profit` / `stop_loss` payloads. In both cases the OCO sits server-side. Children are GTC (invariant 8); IBKR additionally sets `outsideRth=True`. Parent is DAY.
 
 The execution flow (from §5.9, restated for completeness):
 
 1. The morning Routine's gameplan lists the candidate.
 2. Backend constructs the full bracket draft, runs all gates, writes it to the `draft_orders` table as `status: draft`. Discord posts the preview embed to `#high-score`.
 3. **You click confirm** — `/confirm <id>` in Discord, or tap the deep link to the local web UI. One action, no fields to fill.
-4. Backend sends the bracket to IBKR. `client_order_id` is set to the `DraftOrder.id` UUID, so a duplicate confirm is rejected by the broker.
-5. IBKR fills the entry; OCO sits server-side and will fire on stop or target *even if your VPS is offline* (because GTC).
-6. Live monitor observes the fill via `execDetailsEvent` (idempotent), writes the position file, posts to `#position-alerts`.
+4. Backend sends the bracket via `broker.submit_bracket(spec)`. `client_order_id` is set to the `DraftOrder.id` UUID, so a duplicate confirm is rejected by IBKR or recovered to the existing order by Alpaca (422 "already exists" → fetch existing).
+5. The broker fills the entry; OCO sits server-side and will fire on stop or target *even if your VPS is offline* (because GTC).
+6. Live monitor observes the fill via `broker.subscribe_trade_updates()` (idempotent), writes the position row, posts to `#position-alerts`.
 
 ### 6.3 Slippage Model
 
-Don't take mid-price as your fill in paper. IBKR's paper sim is mildly optimistic; layer on top of it:
+Don't take mid-price as your fill in paper. Both IBKR's paper sim and Alpaca's are mildly optimistic; layer on top of either:
 
 - Limit orders: fill only if price *crosses through* your limit by at least 1bp during the bar; assume 50% fill probability if it just touches.
 - Market orders (used only for closes if OCO doesn't fire): fill at ask + 5bps (buy) or bid - 5bps (sell), plus 2bps for assumed market impact on size > $5k.
@@ -789,3 +804,29 @@ Total lines removed across `src/`, `tests/`, `cowork-prompts/`, `vault-templates
 - A custom MCP server for Postgres. The dashboard endpoints + `psql` via Bash were sufficient and avoid yet another moving part.
 - Migration tooling to rebuild any existing v0.2.0 vault data — there was none in production (the writer never wrote).
 - A custom dashboard frontend. The endpoints exist; build one if/when Discord + skill summaries stop being enough.
+
+**v0.4.0 (2026-05-11) — Alpaca paper broker via generic `BrokerAdapter`.** Triggered by the friction of IBKR setup for paper work: IB Gateway needs IBC + Xvfb, has a nightly logout window, and refuses headless paper sessions over weekends. Alpaca's paper API is two keys and a REST/WS pair. The plan: keep IBKR as the live path (Alpaca brokerage is US-only and the operator is in Canada), and add Alpaca as the easy-setup paper option behind a generic broker contract so the rest of the system never sees the difference.
+
+Landed across four parallel waves on `claude/goofy-shamir-df5daa`; PR #1 merged to `main` as `7ffcd78`; tagged `v0.4.0`. 157 tests passing. Highlights:
+
+- **Wave A — broker abstraction foundation** (commit `f1be7d3`). Added `Broker` enum and `ALPACA_*` settings to `src/config.py`; replaced `_validate_mode_port` with per-broker `_validate_broker_mode` enforcing the §6.1 truth table (Alpaca live is refused at boot). Extended `BrokerAdapter` with `iter_open_orders`, `iter_positions`, `repair_child_to_gtc`, and `subscribe_trade_updates` plus matching `OpenOrder` / `BrokerPosition` / `TradeUpdate` dataclasses. Implemented the first three on `IBKRBroker`; `subscribe_trade_updates` stub left for Wave C.
+- **Wave B — Alpaca adapter and tests** (commit `11ce5bf`). `src/broker/alpaca.py` over raw `httpx` + `websockets`. Bracket submit verifies child GTC and self-repairs if not; idempotent re-submit recovers via `/v2/orders:by_client_order_id` on 422 "already exists"; cancel swallows 404/422; quotes return midpoint; positions sign-flip for short; tenacity retries 429 and 5xx only. WS auth + reconnect with capped exponential backoff and clean cancellation. 21 adapter tests via `httpx.MockTransport` and a fake WS class — real cassette recording is a developer-local step per `tests/broker/cassettes/README.md`.
+- **Wave C — broker-agnostic monitor + reconciler + WS bridge** (commit `1f5a971`). `src/safety/reconciler.py` and `src/orders/monitor.py` rewritten to drive off `BrokerAdapter` only; `IBKRBroker` imports removed from every consumer. The monitor loop is one `async for update in broker.subscribe_trade_updates(): await _handle_update(update)`. IBKR's adapter now bridges `orderStatusEvent` + `execDetailsEvent` into an asyncio queue. Audit-log rows carry `broker = settings.broker.value` so paper-IBKR vs paper-Alpaca repairs are distinguishable historically. Verifiable invariants: `grep -r "from src.broker.ibkr import" src/` returns matches only inside `src/broker/`; `grep -r "broker\._ib" src/` returns matches only inside `src/broker/ibkr.py`.
+- **Wave D — docs sweep** (commit `e5aa67f`). `docs/BROKER_SETUP.md` restructured around "Choose your broker"; `docs/ENV.md` and `.env.example` updated; `CHANGELOG.md` v0.4.0 entry; `docs/AUDIT.md` per-component reviews appended.
+
+**Invariants changed in v0.4:**
+
+- Invariant 1 was *"Paper and live differ only by broker endpoint and `mode` flag"* → now *"Paper and live differ by the `mode` flag and which `BrokerAdapter` is selected by `BROKER`."* Live remains IBKR-only.
+- Invariant 7 was *"IBKR's view is the source of truth"* → now *"the active broker's view is the source of truth"*, implemented via the broker-agnostic `iter_*` contract.
+- Invariant 8 was *"the reconciler audit is the safety net"* → now *"two-layer safety net: every adapter verifies + self-repairs on submit, and the reconciler audits drift on the wire."* The first layer was added because Alpaca bracket children can return as DAY-tif.
+- Invariant 9 was *"MODE↔port coupling"* (IBKR-only assumption) → now *"`BROKER`↔`MODE` coupling"* with a per-broker validator. IBKR keeps the port check; Alpaca requires the two API keys for paper and refuses live.
+
+**Explicitly NOT done in v0.4** (carried as future considerations):
+
+- Alpaca live brokerage. US-only; not applicable.
+- Alpaca crypto or options. Equities only, matching current scope.
+- Replacing Polygon → yfinance for OHLCV history. Alpaca's quote endpoint is only used by `get_last_price()`; bar history stays on the existing path.
+- Cross-broker position migration tooling. Paper accounts are disposable; the system trades on one broker at a time.
+- A `BROKER=both` mode. Running both requires two deployments with different `MODE`-tag columns.
+
+Open loops at v0.4.0 ship time: push `main` + `v0.4.0` to origin (currently local-only), record real Alpaca VCR cassettes against a paper account, run one end-to-end paper trade on Alpaca to validate the WS fill path, register the five `.claude/skills/` as cloud Routines via `/schedule`, production deploy to the VPS.
