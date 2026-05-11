@@ -2,7 +2,7 @@
 
 Subscribes to IBKR's order/trade events via ib_async and translates fills into:
   - Position rows (on entry fills)
-  - Closure inbox events (on stop/target fills) — for Cowork's hourly run
+  - Position closure rows (on stop/target fills) — read by the hourly-closure skill
   - Discord #position-alerts pings
 
 Stops and targets live SERVER-SIDE at the broker as bracket orders. This monitor
@@ -37,7 +37,6 @@ from src.db.models import (
 from src.discord_bot.webhooks import post_position_alert
 from src.logging_config import get_logger
 from src.safety.reconciler import reconcile_against_broker
-from src.vault.writer import write_closure_event, write_position
 
 logger = get_logger(__name__)
 
@@ -277,13 +276,6 @@ class LiveMonitor:
         ))
         await db.commit()
 
-        try:
-            vault_path = write_position(position)
-            position.vault_path = str(vault_path)
-            await db.commit()
-        except Exception as e:
-            logger.warning("vault_position_write_failed", error=str(e))
-
         await post_position_alert(
             title=f"ENTRY: {ticker}",
             description=(
@@ -345,12 +337,6 @@ class LiveMonitor:
             },
         ))
         await db.commit()
-
-        try:
-            write_position(position)
-            write_closure_event(position)
-        except Exception as e:
-            logger.warning("vault_closure_write_failed", error=str(e))
 
         color = 0x22C55E if (position.pnl_usd or 0) > 0 else 0xEF4444
         reason = position.close_reason.value if position.close_reason else "unknown"

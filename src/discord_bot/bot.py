@@ -6,7 +6,7 @@ Commands:
   /positions             — list open positions
   /pnl [period]          — equity & P&L summary
   /snooze <ticker> <days> [reason] — temporarily ignore signals on a ticker
-  /thesis <position_id>  — show the latest Cowork-written thesis for an open position
+  /thesis <position_id>  — show the latest analyst thesis for an open position
 
 The bot defers heavy work to the API layer (calls /confirm, /skip endpoints
 internally). This keeps Discord responses snappy and centralises broker

@@ -281,10 +281,7 @@ def monitor(monkeypatch):
     """A LiveMonitor with all I/O side effects stubbed out."""
     # Avoid touching the broker at construction.
     monkeypatch.setattr("src.orders.monitor.make_broker", lambda: MagicMock())
-    # Stub out vault + Discord I/O to keep tests hermetic.
-    monkeypatch.setattr(
-        "src.orders.monitor.write_position", lambda *a, **kw: "/tmp/fake.md"
-    )
+    # Stub out Discord I/O to keep tests hermetic.
     monkeypatch.setattr(
         "src.orders.monitor.post_position_alert", AsyncMock()
     )

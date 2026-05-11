@@ -1,6 +1,6 @@
 """Order builder.
 
-Takes a ScoredSignal (or a Cowork ACT-TODAY entry) and constructs a DraftOrder
+Takes a ScoredSignal (or a morning-analyze skill ACT-TODAY entry) and constructs a DraftOrder
 row in the DB. The order is NOT sent to the broker yet — that happens via
 /confirm in api/main.py or the Discord bot.
 

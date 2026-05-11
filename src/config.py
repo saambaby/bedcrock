@@ -6,9 +6,8 @@ All other modules import from here, never from os.environ directly.
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,9 +37,6 @@ class Settings(BaseSettings):
     # --- Database ---
     database_url: str = "postgresql+asyncpg://bedcrock:bedcrock@localhost:5432/bedcrock"
 
-    # --- Vault ---
-    vault_path: Path = Field(default=Path("/home/bedcrock/vault/Trading"))
-
     # --- Broker (IBKR) ---
     # Paper: port 4002 (Gateway) or 7497 (TWS)
     # Live:  port 4001 (Gateway) or 7496 (TWS)
@@ -68,6 +64,10 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8080
     api_signing_secret: SecretStr = SecretStr("change-me")
+    # Bearer token for /dashboard/* and /scoring-proposals endpoints consumed
+    # by Claude Code skills. If empty, falls back to api_signing_secret so
+    # local-dev setups don't need a second secret.
+    api_bearer_token: SecretStr = SecretStr("")
 
     # --- Schedule ---
     ingest_interval_fast_min: int = 15
@@ -96,13 +96,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: LogFormat = LogFormat.JSON
     sentry_dsn: str = ""
-
-    @field_validator("vault_path")
-    @classmethod
-    def _vault_path_absolute(cls, v: Path) -> Path:
-        if not v.is_absolute():
-            raise ValueError(f"VAULT_PATH must be absolute, got {v}")
-        return v
 
     @field_validator("database_url")
     @classmethod

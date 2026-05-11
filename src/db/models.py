@@ -1,11 +1,7 @@
 """SQLAlchemy 2.0 async ORM models.
 
-This is the cache layer. The vault is the source of truth — DB rows are written
-to from the vault writer, and the vault writer also writes the .md files. The
-DB is what powers the Discord bot, the API, and the live monitor.
-
-If the DB is wiped, run `python -m src.workers.rehydrate` to rebuild from the
-vault. (TODO: rehydrate worker — not in v0.1.)
+Postgres is the canonical store for all bedcrock state. Discord is the alert
+and control plane; Claude Code Routines reason over the DB via FastAPI.
 """
 
 from __future__ import annotations
@@ -19,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -178,9 +175,6 @@ class Signal(Base):
     # Original payload from upstream — kept verbatim for forensic replay
     raw: Mapped[dict] = mapped_column(JSONB, default=dict)
 
-    # Vault path of the .md file this signal was written to
-    vault_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     __table_args__ = (
         Index("ix_signals_source_extid", "source", "source_external_id", unique=True),
         Index("ix_signals_ticker_disclosed", "ticker", "disclosed_at"),
@@ -310,9 +304,6 @@ class Position(Base):
     # Source signals
     source_signal_ids: Mapped[list] = mapped_column(JSONB, default=list)
 
-    # Vault path
-    vault_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-
 
 class EquitySnapshot(Base):
     """Daily equity curve. Written end-of-session."""
@@ -370,6 +361,56 @@ class AuditLog(Base):
     target_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class ScoringProposal(Base):
+    """A proposed update to scoring weights, written by the weekly-synthesis skill.
+
+    Replaces the v0.2 `99 Meta/scoring-rules-proposed.md` vault file. The replay
+    engine reads `status='pending'` rows, evaluates them against historical
+    data, writes a `ScoringReplayReport`, and (on the human's review) the
+    status flips to `accepted` or `rejected`.
+    """
+
+    __tablename__ = "scoring_proposals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    proposed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    weights: Mapped[dict] = mapped_column(JSONB, default=dict)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)  # e.g. "weekly-synthesis"
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_report_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("scoring_replay_reports.id", use_alter=True, name="fk_proposal_replay"),
+        nullable=True,
+    )
+
+
+class ScoringReplayReport(Base):
+    """Out-of-sample evaluation results for a scoring proposal."""
+
+    __tablename__ = "scoring_replay_reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    proposal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("scoring_proposals.id", use_alter=True, name="fk_replay_proposal"),
+        index=True,
+    )
+    in_sample_sharpe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    out_of_sample_sharpe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sharpe_delta_vs_baseline: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recommendation: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DailyState(Base):
