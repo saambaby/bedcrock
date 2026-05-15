@@ -6,7 +6,7 @@ Read this on every session for architecture, decisions, patterns, gotchas. Also 
 ## Stack at a glance
 
 - Python 3.11+ async backend — FastAPI + SQLAlchemy[asyncio]/asyncpg on Postgres
-- Broker — `ib_async` against IB Gateway (paper 4002, live 4001; MODE↔port coupling enforced at boot)
+- Broker — `BROKER=ibkr|alpaca`. IBKR (`ib_async` against IB Gateway, paper 4002 / live 4001) is the only live path. Alpaca (raw `httpx` + `websockets` against `paper-api.alpaca.markets`) is paper-only. `BROKER=alpaca MODE=live` refuses to boot.
 - Reasoning — Claude Code Routines in `.claude/skills/` (morning-analyze, intraday-check, hourly-closure, weekly-synthesis, status), registered via `/schedule`
 - Alerts/control — discord.py + discord-webhook; humans `/confirm` entries, broker enforces exits via server-side OCO
 - Deploy — `docker compose` (dev), systemd on VPS (prod); see `docs/DEPLOYMENT.md`
@@ -27,8 +27,9 @@ mypy src
 ## Notes
 
 - No in-process LLM. Don't reintroduce one — reasoning lives in `.claude/skills/` only.
-- No mocks in prod paths. Tests use VCR cassettes recorded against real endpoints, not hand-written fakes.
-- Never emit a child order with `tif != "GTC"`. The reconciler is the safety net; don't rely on it.
-- Postgres is canonical for signals/orders history; IBKR is the source of truth for live positions/open orders. On conflict, the broker wins and the DB is repaired with an audit-log row.
-- `MODE=paper` requires `IBKR_PORT ∈ {4002, 7497}`; `MODE=live` requires `{4001, 7496}`. Don't add code that bypasses the boot-time check in `src/config.py`.
+- No mocks in prod paths. Tests use VCR cassettes recorded against real endpoints (Alpaca paper cassettes use `httpx.MockTransport` until recorded — see `tests/broker/cassettes/README.md`).
+- Never emit a child order with `tif != "GTC"`. Two-layer safety net: every adapter verifies + self-repairs on submit, and the reconciler audits drift on the wire. Don't rely on either alone.
+- Consumers must talk to `BrokerAdapter` (`src/broker/base.py`), not concrete classes. No `from src.broker.ibkr import IBKRBroker` outside `src/broker/`. No `broker._ib` outside `src/broker/ibkr.py`.
+- Postgres is canonical for signals/orders history; the broker is the source of truth for live positions/open orders. On conflict, the broker wins and the DB is repaired with a broker-tagged audit-log row.
+- Boot-time validator dispatches per broker (see `_validate_broker_mode` in `src/config.py`): IBKR has MODE↔port coupling; Alpaca refuses live and requires the two API keys for paper. Don't add code that bypasses it.
 - `docs/AUDIT.md` is the running per-component review log — append to it on any PR that touches a reviewed component.
